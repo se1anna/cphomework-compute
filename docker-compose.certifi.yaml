@@ -1,0 +1,7 @@
+services:
+  rfc-audit-agent:
+    image: local/cphomework-compute-rfc-audit-agent:certifi-2026.10.19
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile.certifi

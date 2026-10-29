@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  rfc-audit-agent:
+    build:
+      context: .
+      # Dockerfile.mirror is a build-only derivative of the supplied CP.zip
+      # Dockerfile; it changes only Ubuntu/PyPI mirrors for this host.
+      dockerfile: Dockerfile.fast
+    container_name: rfc-audit-agent-worker
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
+    environment:
+      - ENVIRONMENT=production
+      - CONTROL_PLANE_URL=${CONTROL_PLANE_URL:-http://host.docker.internal:8787}
+      - COMPUTE_AUTH_TOKEN=${COMPUTE_AUTH_TOKEN:?Set COMPUTE_AUTH_TOKEN in .env before starting the worker}
+      - WORKER_ID=${WORKER_ID:-rfc-audit-docker-01}
+      - POLL_INTERVAL_EMPTY=15
+      - COOLDOWN_AFTER_TASK=10
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - LLM_MAX_OUTPUT_TOKENS=${LLM_MAX_OUTPUT_TOKENS:-20000}
+      - LLM_REQUEST_TIMEOUT_SEC=${LLM_REQUEST_TIMEOUT_SEC:-900}
+      - PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+      - PIP_DEFAULT_TIMEOUT=30
+      - PIP_RETRIES=5
+      - MALICIOUS_DEPENDENCY_CACHE_FILE=/app/cache/dependency-audit/malicious-dependencies.json
+      - AUDIT_LOG_FILE=/app/logs/audit.jsonl
+      - GIT_SSH_KNOWN_HOSTS_FILE=/run/secrets/git-ssh/known_hosts
+    volumes:
+      # 持久化缓存卷 (确保学生虚拟环境与 wheel 跨容器复用)
+      - ./cache/venvs:/app/cache/venvs
+      - ./cache/pip-cache:/app/cache/pip-cache
+      - ./cache/cargo-cache:/app/cache/cargo-cache
+      - ./cache/dependency-audit:/app/cache/dependency-audit
+      - ./workspace:/app/workspace
+      - ./logs:/app/logs
+      - ./secrets/ssh/known_hosts:/run/secrets/git-ssh/known_hosts:ro
+    # 若宿主机支持 NVIDIA GPU，取消下方注释启用 CUDA 直通
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,20 @@
+# Preserve the exact running application image; update only Mozilla's CA bundle.
+FROM cphomework-compute-rfc-audit-agent:certifi-base-20261022
+
+RUN python3 - <<'PY'
+import hashlib
+import pathlib
+import subprocess
+import sys
+import urllib.request
+
+url = "https://files.pythonhosted.org/packages/c4/51/29046e48f693c54e5b7412216d447a1d8362c9653148d98c02cdf65fa733/certifi-2026.10.19-py3-none-any.whl"
+expected = "42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b"
+wheel = pathlib.Path("/tmp/certifi-2026.10.19-py3-none-any.whl")
+wheel.write_bytes(urllib.request.urlopen(url, timeout=30).read())
+actual = hashlib.sha256(wheel.read_bytes()).hexdigest()
+if actual != expected:
+    raise SystemExit(f"certifi wheel SHA-256 mismatch: {actual}")
+subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", str(wheel)], check=True)
+wheel.unlink()
+PY

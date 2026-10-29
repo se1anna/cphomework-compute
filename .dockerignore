@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.git/
+cache/
+workspace/
+logs/
+secrets/
+.gitignore

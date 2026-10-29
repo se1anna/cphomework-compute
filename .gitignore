@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+secrets/
+cache/
+workspace/
+logs/
+__pycache__/
+*.pyc

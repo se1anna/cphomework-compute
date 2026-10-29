@@ -1,0 +1,10 @@
+# Incremental rebuild: reuse the already audited CP.zip image and dependency
+# layers; only replace application source. This avoids redownloading the 1.1GB
+# compiler toolchain for every source-only change.
+# Pin the previously inspected runtime layer for source-only rebuilds.
+FROM cphomework-compute-rfc-audit-agent@sha256:26838c17b5c87f18aa5b2d3dbc18c34018faf038ee64f18a11e06e571fd6437d
+USER root
+COPY --chown=agentuser:agentuser . /app/
+USER agentuser
+WORKDIR /app
+CMD ["python3", "main.py"]
