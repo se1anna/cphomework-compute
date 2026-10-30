@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 import requests
+from core.llm_response_cache import cache_llm_response
 
 from config import OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL, LLM_MAX_OUTPUT_TOKENS, LLM_REQUEST_TIMEOUT_SEC, MAX_SECURITY_AUDIT_CHARS
 from core.models import TaskPayload
@@ -168,6 +169,7 @@ def judge_static_security(code_files: Dict[str, str], primary_language: str = "p
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
         }, json=body, timeout=(15, LLM_REQUEST_TIMEOUT_SEC))
+        cache_llm_response(response, "static_security_audit")
         stage = "http_status"
         response_bytes = len(response.content) if response.content is not None else 0
         response.raise_for_status()
@@ -281,6 +283,7 @@ def judge_topic_relevance(task: TaskPayload, code_files: Dict[str, str]) -> Topi
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json",
             }, json=body, timeout=(15, LLM_REQUEST_TIMEOUT_SEC))
+            cache_llm_response(response, "topic_relevance")
             stage = "http_status"
             response_bytes = len(response.content) if response.content is not None else 0
             response.raise_for_status()

@@ -93,6 +93,41 @@ class TestPythonVenv(unittest.TestCase):
             self.assertNotIn("COMPUTE_AUTH_TOKEN", env)
             self.assertNotIn("GITLABAPIKEY", env)
 
+    def test_installer_propagates_configured_ustc_mirror_and_retries(self):
+        repo = self.temp_dir / "repo"
+        repo.mkdir()
+        (repo / "requirements.txt").write_text("demo-package>=1\n", encoding="utf-8")
+        venv_root = self.temp_dir / "venvs"
+        pip_cache = self.temp_dir / "pip-cache"
+
+        def fake_run(command, **kwargs):
+            if command[1:3] == ["-m", "venv"]:
+                target = Path(command[-1])
+                (target / "bin").mkdir(parents=True, exist_ok=True)
+                (target / "bin" / "python").touch()
+            elif "download" in command:
+                destination = Path(command[command.index("--dest") + 1])
+                with zipfile.ZipFile(destination / "demo_package-1.0-py3-none-any.whl", "w") as archive:
+                    archive.writestr("demo_package/__init__.py", "VALUE = 1\n")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.dict("os.environ", {
+            "PIP_INDEX_URL": "https://pypi.mirrors.ustc.edu.cn/simple",
+            "PIP_DEFAULT_TIMEOUT": "30",
+            "PIP_RETRIES": "5",
+            "OPENAI_API_KEY": "must-not-propagate",
+        }), patch("env_manager.python_venv.VENV_CACHE_DIR", venv_root), \
+             patch("env_manager.python_venv.PIP_CACHE_DIR", pip_cache), \
+             patch("env_manager.python_venv.subprocess.run", side_effect=fake_run) as run, \
+             patch("env_manager.python_venv.audit_venv_dependencies", return_value=[]):
+            get_or_create_cached_venv(repo, requirements_file="requirements.txt")
+
+        download_env = run.call_args_list[1].kwargs["env"]
+        self.assertEqual(download_env["PIP_INDEX_URL"], "https://pypi.mirrors.ustc.edu.cn/simple")
+        self.assertEqual(download_env["PIP_DEFAULT_TIMEOUT"], "30")
+        self.assertEqual(download_env["PIP_RETRIES"], "5")
+        self.assertNotIn("OPENAI_API_KEY", download_env)
+
 
 if __name__ == "__main__":
     unittest.main()

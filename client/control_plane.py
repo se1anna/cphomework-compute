@@ -5,6 +5,7 @@ RFC Audit Agent - 控制层解耦心跳客户端
 
 import time
 import requests
+from core.llm_response_cache import cache_llm_response
 from typing import Optional
 from config import (
     CONTROL_PLANE_URL,
@@ -57,6 +58,7 @@ class ControlPlaneClient:
                 json={"model": OPENAI_MODEL, "messages": [{"role": "user", "content": "Reply with exactly OK."}], "max_tokens": 128, "temperature": 1.0},
                 timeout=min(POLL_TIMEOUT_SEC, 15),
             )
+            cache_llm_response(response, "llm_health_probe")
             if response.ok:
                 data = response.json()
                 content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")

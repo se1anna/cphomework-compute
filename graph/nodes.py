@@ -9,6 +9,7 @@ import time
 import json
 import shlex
 import requests
+from core.llm_response_cache import cache_llm_response
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 
@@ -76,11 +77,23 @@ def _agent_entry_plan(task: Any, repo_dir: Path, raw_codes: Dict[str, str], lang
             "messages": [{"role": "system", "content": ENTRY_AGENT_SYSTEM_PROMPT},
                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]}
     endpoint = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
-    response = requests.post(endpoint, headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
-                                                 "Content-Type": "application/json"},
-                              json=body, timeout=(15, LLM_REQUEST_TIMEOUT_SEC))
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"].get("content")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
+               "Content-Type": "application/json"}
+    content = None
+    for max_tokens in (1200, 2400):
+        request_body = {**body, "max_tokens": max_tokens}
+        response = requests.post(endpoint, headers=headers, json=request_body,
+                                 timeout=(15, LLM_REQUEST_TIMEOUT_SEC))
+        cache_llm_response(response, "dynamic_entry_planner")
+        response.raise_for_status()
+        response_data = response.json()
+        choices = response_data.get("choices") or []
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        content = (choice.get("message") or {}).get("content")
+        if choice.get("finish_reason") != "length":
+            break
+    else:
+        raise ValueError("动态入口规划 Agent 连续两次因 token 上限截断")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("动态入口规划 Agent 返回空内容")
     match = re.search(r"\{.*\}", content.strip(), flags=re.S)
@@ -632,6 +645,7 @@ def _call_llm_evaluator(
             json=body,
             timeout=(15, LLM_REQUEST_TIMEOUT_SEC),
         )
+        cache_llm_response(res, "rfc_report_generation")
         if not res.ok:
             return None, None, f"大模型接口返回 HTTP {res.status_code}: {res.text[:300]}"
 

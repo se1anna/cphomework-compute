@@ -126,6 +126,13 @@ def get_or_create_cached_venv(
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "PIP_CONFIG_FILE": os.devnull,
+            # Keep the curated mirror in the otherwise-sanitized installer
+            # environment; pip ignores the worker's inherited environment.
+            "PIP_INDEX_URL": os.environ.get(
+                "PIP_INDEX_URL", "https://pypi.mirrors.ustc.edu.cn/simple"
+            ),
+            "PIP_DEFAULT_TIMEOUT": os.environ.get("PIP_DEFAULT_TIMEOUT", "30"),
+            "PIP_RETRIES": os.environ.get("PIP_RETRIES", "5"),
             "PIP_CACHE_DIR": str(PIP_CACHE_DIR),
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             "PIP_NO_INPUT": "1",

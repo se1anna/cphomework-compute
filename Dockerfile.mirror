@@ -14,7 +14,7 @@ RUN mkdir -p /app/workspace /app/cache/venvs /app/cache/pip-cache /app/cache/car
     chown -R agentuser:agentuser /app && chmod 750 /app/workspace /app/cache
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -i https://pypi.mirrors.ustc.edu.cn/simple \
     -r /app/requirements.txt
 COPY --chown=agentuser:agentuser . /app/
 ENV PIP_CACHE_DIR=/app/cache/pip-cache CARGO_HOME=/app/cache/cargo-cache HOME=/home/agentuser

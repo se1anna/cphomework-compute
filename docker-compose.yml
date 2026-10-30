@@ -29,7 +29,7 @@ services:
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
       - LLM_MAX_OUTPUT_TOKENS=${LLM_MAX_OUTPUT_TOKENS:-20000}
       - LLM_REQUEST_TIMEOUT_SEC=${LLM_REQUEST_TIMEOUT_SEC:-900}
-      - PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+      - PIP_INDEX_URL=https://pypi.mirrors.ustc.edu.cn/simple
       - PIP_DEFAULT_TIMEOUT=30
       - PIP_RETRIES=5
       - MALICIOUS_DEPENDENCY_CACHE_FILE=/app/cache/dependency-audit/malicious-dependencies.json

@@ -7,6 +7,7 @@ import re
 from typing import Dict, Iterable, List, Sequence
 
 import requests
+from core.llm_response_cache import cache_llm_response
 
 from config import (
     ALLOWED_CODE_EXTENSIONS,
@@ -161,6 +162,7 @@ paths 只能来自给定 tree，或者是 tree 中目录的前缀。"""
                                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]},
             timeout=(15, LLM_REQUEST_TIMEOUT_SEC),
         )
+        cache_llm_response(response, "clone_planner")
         response.raise_for_status()
         content = response.json()["choices"][0]["message"].get("content")
         if not isinstance(content, str) or not content.strip():
