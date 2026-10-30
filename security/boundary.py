@@ -5,6 +5,7 @@ RFC Audit Agent - 高熵 Nonce 边界符隔离与 Untrusted Code 转义协议
 
 import secrets
 import re
+import html
 from typing import Dict
 
 
@@ -27,7 +28,7 @@ def escape_untrusted_code_content(raw_code: str) -> str:
     escaped = raw_code.replace("]]>", "]]&gt;")
     
     # 中和仿冒的标签
-    escaped = re.sub(r"<\s*/?\s*UNTRUSTED_STUDENT_CODE[^>]*>", "[NEUTRALIZED_TAG]", escaped, flags=re.IGNORECASE)
+    escaped = re.sub(r"<\s*/?\s*(?:UNTRUSTED_STUDENT_CODE|UNTRUSTED_RUNTIME_OUTPUT)[^>]*>", "[NEUTRALIZED_TAG]", escaped, flags=re.IGNORECASE)
     escaped = re.sub(r"<\s*/?\s*SYSTEM[^>]*>", "[NEUTRALIZED_SYSTEM_TAG]", escaped, flags=re.IGNORECASE)
     
     return escaped
@@ -41,12 +42,35 @@ def wrap_code_in_security_boundary(
 ) -> str:
     """将单个代码文件使用高熵 Nonce 与 CDATA 边界严格包裹"""
     clean_code = escape_untrusted_code_content(raw_code)
+    safe_nonce = _escape_attribute(nonce)
+    safe_filename = _escape_attribute(filename)
+    safe_lang = _escape_attribute(lang)
     
-    return f"""<UNTRUSTED_STUDENT_CODE nonce="{nonce}" filename="{filename}" lang="{lang}">
+    return f"""<UNTRUSTED_STUDENT_CODE nonce="{safe_nonce}" filename="{safe_filename}" lang="{safe_lang}">
 <![CDATA[
 {clean_code}
 ]]>
 </UNTRUSTED_STUDENT_CODE>"""
+
+
+def _escape_attribute(value: str) -> str:
+    """Escape an untrusted value for a quoted XML-like attribute."""
+    escaped = html.escape(str(value), quote=True)
+    return "".join(
+        f"&#x{ord(char):02X};" if ord(char) < 0x20 or ord(char) == 0x7f else char
+        for char in escaped
+    )
+
+
+def wrap_untrusted_runtime_output(source: str, raw_text: str, nonce: str) -> str:
+    """Wrap stdout/stderr/history as data, never as evaluator instructions."""
+    safe_source = _escape_attribute(source)
+    safe_nonce = _escape_attribute(nonce)
+    content = escape_untrusted_code_content(raw_text or "")
+    return (
+        f'<UNTRUSTED_RUNTIME_OUTPUT nonce="{safe_nonce}" source="{safe_source}">\n'
+        f"<![CDATA[\n{content}\n]]>\n</UNTRUSTED_RUNTIME_OUTPUT>"
+    )
 
 
 def build_isolated_code_payload(

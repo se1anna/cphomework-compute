@@ -56,6 +56,7 @@ PRODUCTION_MODE = os.getenv("ENVIRONMENT", "development").lower() == "production
 MAX_FILE_COUNT = int(os.getenv("MAX_FILE_COUNT", "500"))
 MAX_SINGLE_CODE_FILE_BYTES = int(os.getenv("MAX_SINGLE_CODE_FILE_BYTES", str(2 * 1024 * 1024))) # 2MB
 MAX_TOTAL_REPO_BYTES = int(os.getenv("MAX_TOTAL_REPO_BYTES", str(100 * 1024 * 1024)))           # 100MB
+MAX_SECURITY_AUDIT_CHARS = int(os.getenv("MAX_SECURITY_AUDIT_CHARS", "120000"))
 SANDBOX_TIMEOUT_SEC = int(os.getenv("SANDBOX_TIMEOUT_SEC", "60"))                               # 沙箱硬超时 60s
 
 # 过滤的大型非代码资产扩展名 (预检直接跳过，不下载)

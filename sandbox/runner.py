@@ -293,10 +293,10 @@ def execute_code_sandbox(
 
         full_stdout = ("\n".join(setup_logs) + "\n\n" + stdout).strip() if setup_logs else stdout
 
-        # 简易解析测试断言输出 (如 pass / total)
-        tests_passed = len(re.findall(r"\b(PASS|OK|passed)\b", stdout, re.IGNORECASE))
-        tests_failed = len(re.findall(r"\b(FAIL|FAILED|error)\b", stdout + stderr, re.IGNORECASE))
-        total_tests = max(1, tests_passed + tests_failed) if tests_passed > 0 else 0
+        # Student-controlled stdout/stderr is never a trusted test oracle.
+        # Only a future evaluator-owned assertion harness may populate counts.
+        tests_passed = 0
+        total_tests = 0
         error_summary = None if proc.returncode == 0 else f"进程退出码为非零: {proc.returncode}"
         if proc.returncode != 0 and language == "python":
             dependency_cause = _classify_missing_import(

@@ -7,10 +7,12 @@ import sys
 import os
 import hashlib
 import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 from typing import Tuple, Optional
 from config import VENV_CACHE_DIR, PIP_CACHE_DIR
-from security.dependency_audit import audit_venv_dependencies
+from security.dependency_audit import audit_venv_dependencies, audit_wheelhouse, parse_dependency_manifest
 from core.exceptions import DependencyRiskException
 
 
@@ -94,8 +96,11 @@ def get_or_create_cached_venv(
         raise RuntimeError(f"无法读取 Agent 选择的依赖清单 `{req_file.relative_to(repo_root)}`: {e}") from e
 
     req_relative = req_file.relative_to(repo_root).as_posix()
-    req_hash = compute_requirements_hash(f"{req_relative}\n{content}")
-    target_venv_dir = VENV_CACHE_DIR / f"venv_{req_hash}"
+    # Validate declarations before any install-side effect. A fresh cache
+    # namespace prevents reuse of environments made by the previous pipeline.
+    declarations = parse_dependency_manifest(req_file)
+    req_hash = compute_requirements_hash(f"safe-wheel-v1\n{req_relative}\n{content}")
+    target_venv_dir = VENV_CACHE_DIR / f"venv_safe_wheels_v1_{req_hash}"
     python_exe = get_venv_python_executable(target_venv_dir)
 
     # 1. 命中缓存：直接 0ms 复用已持久化的虚拟环境
@@ -106,53 +111,79 @@ def get_or_create_cached_venv(
                f"使用依赖清单 `{req_relative}`，命中缓存 ({req_hash})。")
         return str(python_exe), log
 
-    # 2. 未命中缓存：自动创建虚拟环境并利用 pip-cache 快速安装
+    # 2. Download wheels only, inspect the archives as data, then install locally.
+    # This avoids executing student-provided PEP 517/build-system hooks.
     setup_logs = [f"[Venv Cache Miss] 首次遇到依赖哈希 ({req_hash})，正在创建独立持久化环境..."]
     try:
+        install_home = target_venv_dir / "install-home"
+        install_tmp = target_venv_dir / "install-tmp"
+        install_home.mkdir(parents=True, exist_ok=True)
+        install_tmp.mkdir(parents=True, exist_ok=True)
+        install_env = {
+            "PATH": os.pathsep.join((str(python_exe.parent), "/usr/local/bin", "/usr/bin", "/bin")),
+            "HOME": str(install_home),
+            "TMPDIR": str(install_tmp),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PIP_CONFIG_FILE": os.devnull,
+            "PIP_CACHE_DIR": str(PIP_CACHE_DIR),
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_INPUT": "1",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
         # 创建 venv
         subprocess.run(
             [sys.executable, "-m", "venv", str(target_venv_dir)],
             check=True,
             capture_output=True,
-            timeout=60
+            timeout=60,
+            env=install_env,
         )
-        
-        # 安装依赖 (指定持久化 pip 缓存目录)
-        if req_file.name == "pyproject.toml":
-            install_cmd = [
-                str(python_exe),
-                "-m", "pip", "install",
-                "--cache-dir", str(PIP_CACHE_DIR),
-                str(req_file.parent)
-            ]
-        else:
-            install_cmd = [
-                str(python_exe),
-                "-m", "pip", "install",
-                "--cache-dir", str(PIP_CACHE_DIR),
-                "-r", str(req_file)
-            ]
-        res = subprocess.run(
-            install_cmd,
-            capture_output=True,
-            text=True,
-            timeout=180
+        if declarations:
+            with tempfile.TemporaryDirectory(prefix="cphomework-wheel-audit-") as temp_name:
+                temp_dir = Path(temp_name)
+                wheelhouse = temp_dir / "wheelhouse"
+                wheelhouse.mkdir()
+                safe_requirements = temp_dir / "requirements.txt"
+                safe_requirements.write_text("\n".join(declarations) + "\n", encoding="utf-8")
+                download_cmd = [
+                    str(python_exe), "-m", "pip", "download",
+                    "--disable-pip-version-check", "--no-input", "--only-binary=:all:",
+                    "--cache-dir", str(PIP_CACHE_DIR), "--dest", str(wheelhouse),
+                    "-r", str(safe_requirements),
+                ]
+                downloaded = subprocess.run(
+                    download_cmd, capture_output=True, text=True, timeout=180, env=install_env,
+                )
+                if downloaded.returncode != 0:
+                    raise RuntimeError(
+                        f"仅 wheel 依赖下载失败 (退出码 {downloaded.returncode}); 未运行构建后端"
+                    )
+                audit_wheelhouse(wheelhouse)
+                install_cmd = [
+                    str(python_exe), "-m", "pip", "install", "--no-index",
+                    "--disable-pip-version-check", "--no-input", "--only-binary=:all:",
+                    "--find-links", str(wheelhouse), "-r", str(safe_requirements),
+                ]
+                installed = subprocess.run(
+                    install_cmd, capture_output=True, text=True, timeout=180, env=install_env,
+                )
+                if installed.returncode != 0:
+                    raise RuntimeError(f"已审计 wheel 安装失败 (退出码 {installed.returncode})")
+
+        audit_venv_dependencies(target_venv_dir)
+        project_relative = search_dir.relative_to(repo_root).as_posix() or "."
+        setup_logs.append(
+            f"[Venv Success] Agent 选择 `{project_relative}`；"
+            f"`{req_relative}` 已通过预检、wheel-only 安装和安装后审计；缓存键 `{req_hash}`。"
         )
-        if res.returncode == 0:
-            audit_venv_dependencies(target_venv_dir)
-            project_relative = search_dir.relative_to(repo_root).as_posix() or "."
-            setup_logs.append(
-                f"[Venv Success] Agent 选择 `{project_relative}`；"
-                f"已从 `{req_relative}` 安装并持久化环境 `/cache/venvs/venv_{req_hash}`。"
-            )
-            return str(python_exe), "\n".join(setup_logs)
-        else:
-            raise RuntimeError(
-                f"依赖安装失败 (退出码 {res.returncode})，禁止使用不完整虚拟环境:\n{res.stderr[:2048]}"
-            )
+        return str(python_exe), "\n".join(setup_logs)
 
     except DependencyRiskException:
         # 恶意依赖审计结果必须原样向上报告，不能回退到系统 Python。
+        shutil.rmtree(target_venv_dir, ignore_errors=True)
         raise
     except Exception as e:
+        shutil.rmtree(target_venv_dir, ignore_errors=True)
         raise RuntimeError(f"虚拟环境初始化失败，未执行学生代码: {e}") from e

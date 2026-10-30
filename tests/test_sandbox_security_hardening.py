@@ -182,6 +182,17 @@ print(f"WORKER_ID={worker_id}")
         self.assertTrue(success)
         self.assertIn("-i", mock_run.call_args.kwargs["env"]["GIT_SSH_COMMAND"])
 
+    def test_student_pass_output_is_not_counted_as_trusted_tests(self):
+        (self.temp_dir / "solution.py").write_text("print('PASS OK passed')\n", encoding="utf-8")
+        result = execute_code_sandbox(
+            self.temp_dir, language="python", entry_file="solution.py", timeout_sec=5
+        )
+        self.assertTrue(result.executed)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.tests_passed, 0)
+        self.assertEqual(result.tests_total, 0)
+        self.assertIn("PASS OK passed", result.stdout)
+
     @patch("security.cloner.subprocess.run")
     def test_mixed_escaped_and_real_deploy_key_newlines_are_normalized(self, mock_run):
         def fake_run(cmd, **kwargs):

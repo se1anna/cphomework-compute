@@ -149,8 +149,8 @@ class TestCheckScoreReasonabilityRules(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertIsNone(rec_score)
 
-    def test_all_pass_harsh_low_score_rejected(self):
-        """规则 2：沙箱全通无报错但打分低于 85 分苛刻压分，必须被驳回并建议上调至慷慨基准 92 分"""
+    def test_success_exit_and_fake_pass_text_do_not_uplift_score(self):
+        """A successful exit and student-authored PASS text provide no score floor."""
         static_pass = StaticAnalysisResult(passed=True, security_clean=True, topic_matched=True, violations=[])
         dynamic_pass = DynamicRunResult(
             executed=True,
@@ -167,12 +167,12 @@ class TestCheckScoreReasonabilityRules(unittest.TestCase):
             score=68.0,
             memo="代码有些冗长"
         )
-        self.assertFalse(is_ok)
-        self.assertIn("过于严苛违背慷慨起评分准则", reason)
-        self.assertEqual(rec_score, 92.0)
+        self.assertTrue(is_ok)
+        self.assertIsNone(reason)
+        self.assertIsNone(rec_score)
 
-    def test_multiround_score_regression_rejected(self):
-        """规则 3：多轮迭代中，上一轮 85 分，本轮代码正常跑通但打出 72 分，严禁倒扣分并建议提分至 >= 88 分"""
+    def test_multiround_history_does_not_uplift_score(self):
+        """Prior round scores do not trigger an automatic uplift."""
         task_round2 = TaskPayload(
             taskId="task-round2",
             studentId="student-test-0001",
@@ -197,12 +197,12 @@ class TestCheckScoreReasonabilityRules(unittest.TestCase):
             score=72.0,
             memo="第二次评测"
         )
-        self.assertFalse(is_ok)
-        self.assertIn("严重违背多轮迭代递增激励哲学", reason)
-        self.assertEqual(rec_score, 88.0)
+        self.assertTrue(is_ok)
+        self.assertIsNone(reason)
+        self.assertIsNone(rec_score)
 
-    def test_verdict_consistency_rejected_memo_with_score(self):
-        """规则 4：报告正文声明 REJECTED 但给分 > 0 分，图文矛盾驳回"""
+    def test_arbitrary_verdict_words_are_not_score_oracles(self):
+        """Arbitrary words in report text do not force a numeric score change."""
         is_ok, reason, rec_score = check_score_reasonability(
             task=self.task,
             static_res=None,
@@ -210,12 +210,11 @@ class TestCheckScoreReasonabilityRules(unittest.TestCase):
             score=60.0,
             memo="本次作业审核结果：REJECTED，因格式问题。"
         )
-        self.assertFalse(is_ok)
-        self.assertIn("声明为 REJECTED，但实际回传分数", reason)
-        self.assertEqual(rec_score, 0.0)
+        self.assertTrue(is_ok)
+        self.assertIsNone(reason)
+        self.assertIsNone(rec_score)
 
-    def test_verdict_consistency_accepted_memo_with_fail_score(self):
-        """规则 4：报告正文声明 ACCEPTED 但给分 < 60 分不及格，图文矛盾驳回"""
+    def test_accepted_word_does_not_impose_score_floor(self):
         is_ok, reason, rec_score = check_score_reasonability(
             task=self.task,
             static_res=None,
@@ -223,9 +222,9 @@ class TestCheckScoreReasonabilityRules(unittest.TestCase):
             score=50.0,
             memo="综合裁定：ACCEPTED，准予通过。"
         )
-        self.assertFalse(is_ok)
-        self.assertIn("声明为 ACCEPTED，但实际回传分数", reason)
-        self.assertEqual(rec_score, 85.0)
+        self.assertTrue(is_ok)
+        self.assertIsNone(reason)
+        self.assertIsNone(rec_score)
 
 
 class TestScoreArbiterNode(unittest.TestCase):
@@ -256,8 +255,7 @@ class TestScoreArbiterNode(unittest.TestCase):
         self.assertFalse(res["needs_reevaluation"])
         self.assertEqual(res["arbitration_critique"], "")
 
-    def test_arbiter_rejects_and_increments_retry(self):
-        """第一次检测到苛刻打分，增加 retries 并生成明确 critique 指令"""
+    def test_arbiter_keeps_reasonable_score_without_floor_retry(self):
         state = {
             "task": self.task,
             "static_analysis": StaticAnalysisResult(passed=True, security_clean=True, topic_matched=True, violations=[]),
@@ -267,13 +265,11 @@ class TestScoreArbiterNode(unittest.TestCase):
             "arbitration_retries": 0
         }
         res = score_arbiter_node(state)
-        self.assertTrue(res["needs_reevaluation"])
-        self.assertEqual(res["arbitration_retries"], 1)
-        self.assertIn("仲裁委员会驳回重评提示 (第 1/2 次)", res["arbitration_critique"])
-        self.assertIn("92.0", res["arbitration_critique"])
+        self.assertFalse(res["needs_reevaluation"])
+        self.assertEqual(res["arbitration_critique"], "")
 
-    def test_arbiter_exhaustion_auto_calibration(self):
-        """重试达到上限 (retries >= 2)，执行确定性自动校准，平滑赋予分数并追加修正案，避免死循环"""
+    def test_arbiter_exhaustion_preserves_score_without_uplift(self):
+        """Retry exhaustion must never turn a low score into an automatic high score."""
         state = {
             "task": self.task,
             "static_analysis": StaticAnalysisResult(passed=True, security_clean=True, topic_matched=True, violations=[]),
@@ -284,10 +280,9 @@ class TestScoreArbiterNode(unittest.TestCase):
         }
         res = score_arbiter_node(state)
         self.assertFalse(res["needs_reevaluation"])
-        self.assertEqual(res["final_score"], 92.0)
-        self.assertIn("[RFC-ARBITRATION-AMENDMENT]", res["rfc_report"])
-        self.assertIn("92.0 分", res["rfc_report"])
-        self.assertEqual(res["final_report_payload"].score, 92.0)
+        self.assertNotIn("final_score", res)
+        self.assertNotIn("final_report_payload", res)
+        self.assertNotIn("rfc_report", res)
 
 
 class TestScoreArbiterGraphLoopE2E(unittest.TestCase):
@@ -302,11 +297,10 @@ class TestScoreArbiterGraphLoopE2E(unittest.TestCase):
 
     @patch("graph.nodes.OPENAI_API_KEY", "mock-key")
     @patch("graph.nodes.requests.post")
-    def test_e2e_re_evaluation_loop_success(self, mock_post):
+    def test_e2e_low_score_is_not_rejected_for_uplift(self, mock_post):
         """
         端到端测试：
-        第 1 次评测模型返回 65 分苛刻分 -> Arbiter 驳回并附带 critique；
-        第 2 次评测模型收到 critique 并纠偏为 94 分 -> Arbiter 审核通过 -> 顺利结束。
+        65 分必须直接保留，不能因为进程成功退出或 PASS 文本而自动要求提分。
         """
         sol_file = self.temp_dir / "solution.py"
         sol_file.write_text("""
@@ -354,15 +348,7 @@ if __name__ == '__main__':
                     }]
                 }
             else:
-                # 第二次吸纳 critique，纠偏为 94 分
-                self.assertIn("评分合理性仲裁委员会指令", user_text)
-                mock_res.json.return_value = {
-                    "choices": [{
-                        "message": {
-                            "content": "# RFC 评阅\n吸纳仲裁意见，代码完全合规跑通。\n**最终评定分数**: **94.0 / 100.0**"
-                        }
-                    }]
-                }
+                raise AssertionError("reasonable low score should not trigger automatic reevaluation")
             return mock_res
 
         mock_post.side_effect = side_effect
@@ -380,18 +366,17 @@ if __name__ == '__main__':
 
         result = self.graph.invoke(state)
 
-        # 验证调用了 2 次 LLM
-        self.assertEqual(call_count, 2)
-        self.assertEqual(result["final_score"], 94.0)
-        self.assertEqual(result["arbitration_retries"], 1)
-        self.assertIn("94.0", result["rfc_report"])
+        self.assertEqual(call_count, 1)
+        self.assertEqual(result["final_score"], 65.0)
+        self.assertEqual(result["arbitration_retries"], 0)
+        self.assertIn("65.0", result["rfc_report"])
 
     @patch("graph.nodes.OPENAI_API_KEY", "mock-key")
     @patch("graph.nodes.requests.post")
-    def test_e2e_re_evaluation_exhaustion_auto_calibration(self, mock_post):
+    def test_e2e_re_evaluation_exhaustion_never_uplifts(self, mock_post):
         """
         端到端测试：
-        若模型固执己见多次返回 65 分 -> 触发 2 次重评 -> 耗尽后自动强制校准为 92 分 -> 保障 Zero-Zombie SLA。
+        重评耗尽后仍保持模型分数，不得自动校准到高分。
         """
         sol_file = self.temp_dir / "solution.py"
         sol_file.write_text("""
@@ -441,12 +426,10 @@ if __name__ == '__main__':
 
         result = self.graph.invoke(state)
 
-        # 验证经历重试耗尽后强制校准出分
-        self.assertEqual(result["final_score"], 92.0)
-        self.assertIn("[RFC-ARBITRATION-AMENDMENT]", result["rfc_report"])
-        self.assertIn("平滑校准为 **92.0 分**", result["rfc_report"])
+        self.assertEqual(result["final_score"], 65.0)
+        self.assertNotIn("[RFC-ARBITRATION-AMENDMENT]", result["rfc_report"])
         self.assertIsNotNone(result.get("final_report_payload"))
-        self.assertEqual(result["final_report_payload"].score, 92.0)
+        self.assertEqual(result["final_report_payload"].score, 65.0)
 
 
 if __name__ == "__main__":

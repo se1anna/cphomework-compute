@@ -19,9 +19,17 @@ from core.models import PreflightResult
 # 保留在沙箱中供程序使用，但不进入 LLM 源码上下文的生成物/缓存目录。
 # 这些目录经常包含 fontlist、编译缓存、测试缓存或第三方依赖副本。
 CONTEXT_EXCLUDED_DIRS = {
-    ".git", ".cache", "__pycache__", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".tox", ".nox", ".venv", "venv", "env",
-    "node_modules", "build", "dist", "target", "site-packages",
+    ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+}
+
+EXECUTABLE_SOURCE_EXTENSIONS = {
+    ".py", ".pyw", ".pyi", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx",
+    ".rs", ".go", ".java", ".jl", ".f90", ".f95", ".f03", ".sh", ".bash",
+    ".zsh", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".php", ".lua",
+}
+OPAQUE_EXECUTABLE_EXTENSIONS = {
+    ".pyc", ".pyo", ".so", ".pyd", ".dll", ".dylib", ".exe", ".class", ".jar", ".wasm",
+    ".zip", ".egg", ".whl",
 }
 
 
@@ -97,13 +105,22 @@ def inspect_repository_tree(repo_dir: Path) -> PreflightResult:
             rel_path = str(fpath.relative_to(resolved_base)).replace("\\", "/")
             suffix = fpath.suffix.lower()
 
+            if suffix in OPAQUE_EXECUTABLE_EXTENSIONS:
+                reason = f"仓库含无法静态审计的可执行二进制文件，安全审计不完整: {rel_path}"
+                risk_reasons.append(reason)
+                security_risks.append(reason)
+
             # 3. 过滤大型数据与媒体文件 (暂缓下载或跳过分析)
             if suffix in FILTERED_EXTENSIONS or fsize > MAX_SINGLE_CODE_FILE_BYTES:
                 filtered_assets.append(f"{rel_path} ({round(fsize / 1024, 1)} KB)")
+                if suffix in EXECUTABLE_SOURCE_EXTENSIONS and fsize > MAX_SINGLE_CODE_FILE_BYTES:
+                    reason = f"可执行源码超过安全审计单文件上限，无法证明完整覆盖: {rel_path}"
+                    risk_reasons.append(reason)
+                    security_risks.append(reason)
                 continue
 
             # 4. 统计合规代码文件与主语言推断
-            if suffix in ALLOWED_CODE_EXTENSIONS or fpath.name in {"Makefile", "CMakeLists.txt", "Cargo.toml", "Dockerfile"}:
+            if suffix in ALLOWED_CODE_EXTENSIONS or suffix in EXECUTABLE_SOURCE_EXTENSIONS or fpath.name in {"Makefile", "CMakeLists.txt", "Cargo.toml", "Dockerfile"}:
                 code_files.append(rel_path)
                 if suffix == ".py":
                     lang_counter["python"] += 1

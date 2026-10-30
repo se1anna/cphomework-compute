@@ -12,8 +12,11 @@ import re
 import shutil
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List
+
+from packaging.requirements import Requirement, InvalidRequirement
 
 from config import MALICIOUS_DEPENDENCY_CACHE_FILE
 from core.exceptions import DependencyRiskException
@@ -35,6 +38,106 @@ _HIGH_CONFIDENCE_RULES = (
 # 这些是 venv 自带的安装器组件，不属于学生声明的第三方依赖；它们会
 # 正常包含下载、证书和路径处理代码，不能把自身能力当作恶意行为。
 _BOOTSTRAP_PACKAGES = {"pip", "setuptools", "wheel"}
+
+
+def parse_dependency_manifest(manifest: Path) -> List[str]:
+    """Parse declarations without executing the project build backend."""
+    if manifest.name.lower() == "pyproject.toml":
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10 production image; pip vendors trusted tomli.
+            from pip._vendor import tomli as tomllib
+        try:
+            data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"无法解析 pyproject.toml: {type(exc).__name__}") from exc
+        project = data.get("project")
+        if not isinstance(project, dict):
+            raise ValueError("pyproject.toml 必须使用 [project].dependencies 声明安装依赖；不会执行 build backend")
+        declarations = project.get("dependencies", [])
+        if not isinstance(declarations, list):
+            raise ValueError("[project].dependencies 必须是 PEP 508 字符串列表")
+    else:
+        declarations = []
+        for raw in manifest.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Includes, pip options, paths and VCS/direct URLs can execute or
+            # redirect installation outside the reviewed, wheel-only pipeline.
+            if line.startswith("-") or " @ " in line or "://" in line or line.startswith((".", "/", "\\")):
+                raise ValueError("requirements 文件包含不支持的 pip 指令、路径或直接 URL；未安装")
+            declarations.append(line.split(" #", 1)[0].strip())
+
+    parsed: List[str] = []
+    cache = _load_cache()
+    for declaration in declarations:
+        if not isinstance(declaration, str):
+            raise ValueError("依赖声明必须为字符串")
+        try:
+            requirement = Requirement(declaration)
+        except InvalidRequirement as exc:
+            raise ValueError("依赖声明不是有效的 PEP 508 requirement") from exc
+        if requirement.url:
+            raise ValueError("不接受 PEP 508 直接 URL 依赖；未安装")
+        key = re.sub(r"[-_.]+", "-", requirement.name).lower()
+        if key in cache:
+            raise DependencyRiskException("依赖清单引用已被安全审计拦截的包", requirement.name)
+        parsed.append(str(requirement))
+    return parsed
+
+
+def audit_wheelhouse(wheelhouse: Path) -> None:
+    """Inspect downloaded wheels as data before pip installs or imports them."""
+    total_size = 0
+    findings: List[str] = []
+    wheels = sorted(wheelhouse.glob("*.whl"))
+    if not wheels:
+        raise RuntimeError("没有下载到可审计的二进制 wheel")
+    for wheel in wheels:
+        total_size += wheel.stat().st_size
+        if total_size > 256 * 1024 * 1024:
+            raise RuntimeError("wheel 总大小超过 256 MiB 安全审计预算")
+        try:
+            with zipfile.ZipFile(wheel) as archive:
+                for info in archive.infolist():
+                    name = info.filename
+                    parts = Path(name).parts
+                    if name.startswith(("/", chr(92))) or chr(92) in name or ".." in parts:
+                        raise DependencyRiskException("wheel 包含越界路径", wheel.name)
+                    lower = name.lower()
+                    if lower.endswith(".pth") or lower.endswith(("/sitecustomize.py", "/usercustomize.py")) or lower in {"sitecustomize.py", "usercustomize.py"}:
+                        raise DependencyRiskException("wheel 包含 Python 启动时自动执行的钩子", f"{wheel.name}:{name}")
+                    if not lower.endswith((".py", ".js", ".mjs", ".sh")):
+                        continue
+                    relative_parts = {part.lower() for part in Path(name).parts}
+                    if relative_parts.intersection({"test", "tests", "testing", "example", "examples", "docs", "doc"}) or any(
+                        part.endswith((".dist-info", ".egg-info")) for part in relative_parts
+                    ):
+                        continue
+                    if info.file_size > 2 * 1024 * 1024:
+                        raise RuntimeError(f"wheel 源码文件超出审计上限: {wheel.name}:{name}")
+                    raw = archive.read(info)
+                    text = raw.decode("utf-8", errors="ignore")
+                    matched = [reason for pattern, reason in _HIGH_CONFIDENCE_RULES if pattern.search(text)]
+                    if "访问凭据或敏感文件" in matched:
+                        has_sensitive_read = bool(re.search(
+                            r"(?:open|read_text|read_bytes|getenv)\s*\([^\n]{0,240}(?:~/.ssh|/\\.aws/|/etc/shadow|\\.env|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)",
+                            text, re.I,
+                        ))
+                        has_outbound = bool(re.search(
+                            r"(?:requests\.(?:get|post|put|request)|httpx\.(?:get|post|put|request)|"
+                            r"urllib\.request\.urlopen|socket\.(?:create_connection|socket)|"
+                            r"ftplib\.FTP|websocket\.create_connection)\s*\(", text, re.I,
+                        ))
+                        if not (has_sensitive_read and has_outbound):
+                            matched.remove("访问凭据或敏感文件")
+                    if matched:
+                        findings.extend(f"{wheel.name}:{name}: {reason}" for reason in matched)
+        except zipfile.BadZipFile as exc:
+            raise RuntimeError(f"无效 wheel 文件: {wheel.name}") from exc
+    if findings:
+        raise DependencyRiskException("wheel 安装前静态审计发现高置信风险", "; ".join(findings[:10]))
 
 
 def _load_cache() -> Dict[str, Any]:

@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 
 import requests
 
-from config import OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL, LLM_MAX_OUTPUT_TOKENS, LLM_REQUEST_TIMEOUT_SEC
+from config import OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL, LLM_MAX_OUTPUT_TOKENS, LLM_REQUEST_TIMEOUT_SEC, MAX_SECURITY_AUDIT_CHARS
 from core.models import TaskPayload
 from core.exceptions import LLMUnavailableException
 from config import PRODUCTION_MODE
@@ -131,7 +131,14 @@ SECURITY_SYSTEM_PROMPT = """你是学生仓库的静态安全审计 Agent，不�
 
 
 def judge_static_security(code_files: Dict[str, str], primary_language: str = "python") -> SecurityJudgement:
-    """生产路径由 LLM 做静态安全裁决；规则扫描仅作无模型时的保守回退。"""
+    """Review complete source; never silently truncate the security corpus."""
+    total_chars = sum(len(content or "") for content in code_files.values())
+    if total_chars > MAX_SECURITY_AUDIT_CHARS:
+        return SecurityJudgement(
+            decision="UNCERTAIN", confidence=0.0,
+            evidence=f"源码共 {total_chars} 字符，超过完整安全审计预算 {MAX_SECURITY_AUDIT_CHARS}；未执行。",
+            findings=["安全审计覆盖不完整"],
+        )
     if not OPENAI_API_KEY or not OPENAI_API_BASE:
         from security.polyglot_scanner import scan_code_files
         clean, violations, _warnings = scan_code_files(code_files, primary_language=primary_language)
@@ -147,7 +154,7 @@ def judge_static_security(code_files: Dict[str, str], primary_language: str = "p
         {"role": "system", "content": SECURITY_SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps({
             "language": primary_language,
-            "repository": _bounded_repository(code_files),
+            "repository": code_files,
         }, ensure_ascii=False)},
     ]}
     stage = "request"
