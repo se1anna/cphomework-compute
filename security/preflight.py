@@ -16,10 +16,9 @@ from config import (
 from core.models import PreflightResult
 
 
-# 保留在沙箱中供程序使用，但不进入 LLM 源码上下文的生成物/缓存目录。
-# 这些目录经常包含 fontlist、编译缓存、测试缓存或第三方依赖副本。
+# 不进入 LLM 源码上下文的生成物/缓存目录。预检仍检查其中的 Python 字节码。
 CONTEXT_EXCLUDED_DIRS = {
-    ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache",
 }
 
 EXECUTABLE_SOURCE_EXTENSIONS = {
@@ -27,8 +26,9 @@ EXECUTABLE_SOURCE_EXTENSIONS = {
     ".rs", ".go", ".java", ".jl", ".f90", ".f95", ".f03", ".sh", ".bash",
     ".zsh", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".rb", ".php", ".lua",
 }
-OPAQUE_EXECUTABLE_EXTENSIONS = {
-    ".pyc", ".pyo", ".so", ".pyd", ".dll", ".dylib", ".exe", ".class", ".jar", ".wasm",
+PYTHON_BYTECODE_EXTENSIONS = {".pyc", ".pyo"}
+OPAQUE_EXECUTABLE_EXTENSIONS = PYTHON_BYTECODE_EXTENSIONS | {
+    ".so", ".pyd", ".dll", ".dylib", ".exe", ".class", ".jar", ".wasm",
     ".zip", ".egg", ".whl",
 }
 
@@ -62,16 +62,22 @@ def inspect_repository_tree(repo_dir: Path) -> PreflightResult:
 
     resolved_base = repo_dir.resolve()
 
-    for root, dirs, files in os.walk(repo_dir):
-        # 忽略 .git 目录内部自身文件
-        if any(part in CONTEXT_EXCLUDED_DIRS for part in Path(root).parts):
-            continue
-        # 不删除、不改动这些目录，只是不让它们污染静态 Agent 上下文。
-        dirs[:] = [d for d in dirs if d not in CONTEXT_EXCLUDED_DIRS]
+    for root, dirs, files in os.walk(resolved_base):
+        root_path = Path(root)
+        rel_root = root_path.relative_to(resolved_base)
+        if "__pycache__" in dirs:
+            reason = f"仓库含未审计的 Python 字节码缓存目录: {(rel_root / '__pycache__').as_posix()!r}"
+            risk_reasons.append(reason)
+            security_risks.append(reason)
+        dirs[:] = [name for name in dirs if name not in {".git", "__pycache__"}]
+        exclude_context = not CONTEXT_EXCLUDED_DIRS.isdisjoint(rel_root.parts)
 
         for fname in files:
+            fpath = root_path / fname
+            suffix = fpath.suffix.lower()
+            if exclude_context and suffix not in PYTHON_BYTECODE_EXTENSIONS:
+                continue
             total_files += 1
-            fpath = Path(root) / fname
             
             # 1. 符号链接安全检查 (防止指向宿主机 /etc 或父目录)
             if fpath.is_symlink():
@@ -103,8 +109,6 @@ def inspect_repository_tree(repo_dir: Path) -> PreflightResult:
 
             total_size += fsize
             rel_path = str(fpath.relative_to(resolved_base)).replace("\\", "/")
-            suffix = fpath.suffix.lower()
-
             if suffix in OPAQUE_EXECUTABLE_EXTENSIONS:
                 reason = f"仓库含无法静态审计的可执行二进制文件，安全审计不完整: {rel_path}"
                 risk_reasons.append(reason)

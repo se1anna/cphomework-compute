@@ -7,6 +7,7 @@ import sys
 import time
 import signal
 import shutil
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -18,7 +19,7 @@ from config import (
     COOLDOWN_AFTER_TASK,
     WORKSPACE_DIR
 )
-from core.models import TaskPayload, RFCReportPayload
+from core.models import MAX_EVALUATION_ROUNDS, TaskPayload, RFCReportPayload
 from core.fallback import (
     build_security_rejection_report,
     build_emergency_fallback_report,
@@ -30,11 +31,34 @@ from core.fallback import build_llm_unavailable_report
 from security.cloner import prepare_student_workspace
 from graph.direct_pipeline import run_direct_audit
 from client.control_plane import ControlPlaneClient
-from core.audit_log import write_event
+from core.audit_log import install_stream_capture, write_event
+
+
+# Capture all subsequent process output in the worker-specific persistent JSONL.
+install_stream_capture()
 
 
 # 优雅停机信号处理
 running = True
+
+
+def _nonzero_history_scores(history):
+    """Return finite positive scores in submission-round order.
+
+    Zero-score closures are deliberately excluded: several represent a failed
+    evaluation rather than a completed student grade.
+    """
+    scored = []
+    for index, item in enumerate(history or []):
+        try:
+            score = float(item.get("score"))
+            round_number = int(item.get("round") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if math.isfinite(score) and score > 0:
+            scored.append((round_number, index, score))
+    scored.sort(key=lambda row: (row[0], row[1]))
+    return [score for _, _, score in scored]
 
 def handle_shutdown_signal(sig, frame):
     global running
@@ -98,36 +122,54 @@ def run_ouroboros_daemon():
         task_workspace: Optional[Path] = None
 
         try:
-            # Step A: 安全浅克隆与工作区准备
-            print("- 正在检出学生代码仓库...")
-            clone_success, target_workdir, clone_log = prepare_student_workspace(task)
-            task_workspace = WORKSPACE_DIR / f"run_{task.taskId}"
-
-            if not clone_success:
-                print(f"[Preflight Block] 检出失败，直接出具拒止报告: {clone_log}")
-                report_payload = build_source_unavailable_report(
-                    task=task,
-                    reason=clone_log
+            nonzero_scores = _nonzero_history_scores(task.history)
+            if len(nonzero_scores) >= MAX_EVALUATION_ROUNDS:
+                locked_score = max(nonzero_scores[:MAX_EVALUATION_ROUNDS])
+                print(
+                    f"[Grade Lock] 已累计 {MAX_EVALUATION_ROUNDS} 次非0分评分，"
+                    "跳过仓库分析与模型评分，保留前三次非0分中的最高分。"
+                )
+                report_payload = RFCReportPayload(
+                    taskId=task.taskId,
+                    studentId=task.studentId,
+                    assignmentId=task.assignmentId,
+                    score=locked_score,
+                    details=(
+                        f"已累计 {MAX_EVALUATION_ROUNDS} 次非0分评分；此成绩已是最终结果，"
+                        f"后续请求不再重新评分，继续返回前三次非0分评分中的最高分（{locked_score:g}分）。"
+                    ),
                 )
             else:
-                print(f"[Clone Plan] {clone_log}")
-                # Step B: 运行直接顺序流水线
-                print("- 启动直接审计流水线 (预检 -> 静态门禁 -> 依赖审计/沙箱 -> RFC多轮评估)...")
-                initial_state = {
-                    "task": task,
-                    "repo_dir": str(target_workdir),
-                    "nonce": "",
-                    "retry_count": 0,
-                    "retry_context": ""
-                }
-                pipeline_result = run_direct_audit(initial_state)
-                report_payload = pipeline_result.get("final_report_payload")
+                # Step A: 安全浅克隆与工作区准备
+                print("- 正在检出学生代码仓库...")
+                clone_success, target_workdir, clone_log = prepare_student_workspace(task)
+                task_workspace = WORKSPACE_DIR / f"run_{task.taskId}"
 
-                if not report_payload:
-                    report_payload = build_emergency_fallback_report(
+                if not clone_success:
+                    print(f"[Preflight Block] 检出失败，直接出具拒止报告: {clone_log}")
+                    report_payload = build_source_unavailable_report(
                         task=task,
-                        error_msg="直接审计流水线完成但未产生合法 report_payload"
+                        reason=clone_log
                     )
+                else:
+                    print(f"[Clone Plan] {clone_log}")
+                    # Step B: 运行直接顺序流水线
+                    print("- 启动直接审计流水线 (预检 -> 静态门禁 -> 依赖审计/沙箱 -> RFC多轮评估)...")
+                    initial_state = {
+                        "task": task,
+                        "repo_dir": str(target_workdir),
+                        "nonce": "",
+                        "retry_count": 0,
+                        "retry_context": ""
+                    }
+                    pipeline_result = run_direct_audit(initial_state)
+                    report_payload = pipeline_result.get("final_report_payload")
+
+                    if not report_payload:
+                        report_payload = build_emergency_fallback_report(
+                            task=task,
+                            error_msg="直接审计流水线完成但未产生合法 report_payload"
+                        )
 
         except SecurityRiskException as se:
             print(f"[Risk Control Alert] 触发安全风控拦截: {se.reason}")

@@ -56,7 +56,7 @@ ENTRY_AGENT_SYSTEM_PROMPT = """你是作业动态执行规划 Agent。你不能�
 对于包含 hw1/hw2/hw3 等多个作业目录的仓库，必须根据本次题目选择对应的 project_dir 和入口文件；若该目录或其祖先存在多个依赖清单，优先选择该作业目录内最近的 requirements.txt/requirement.txt/pyproject.toml，不能误用其他作业目录的清单。将所选依赖文件路径明确写入 requirements_file；没有合适清单时填空字符串。
 只输出 JSON，不要 Markdown：
 {"run":true,"done":false,"command":"python <仓库内相对路径.py>","path":"<仓库内相对路径.py>","project_dir":"<所选作业目录相对路径>","requirements_file":"<所选清单相对路径或空字符串>","reason":"简短理由"}
-限制：command 必须是单个 Python 文件的直接运行命令；不要 shell 管道、重定向、&&、sudo、网络命令、删除命令、绝对路径或 ..。如果没有任何适合运行的源文件，输出 {"run":false,"command":"","path":"","reason":"具体原因"}。"""
+限制：command 必须是单个 Python 文件的直接运行命令，只使用 python 或 python3 加文件路径，不加脚本参数或解释器选项；不要 shell 管道、重定向、&&、sudo、网络命令、删除命令、绝对路径或 ..。如果没有任何适合运行的源文件，输出 {"run":false,"command":"","path":"","reason":"具体原因"}。"""
 
 
 def _agent_entry_plan(task: Any, repo_dir: Path, raw_codes: Dict[str, str], language: str,
@@ -73,27 +73,44 @@ def _agent_entry_plan(task: Any, repo_dir: Path, raw_codes: Dict[str, str], lang
         "files": {name: (content or "")[:10000] for name, content in raw_codes.items()},
         "previous_dynamic_results": dynamic_history[-12000:],
     }
-    body = {"model": OPENAI_MODEL, "temperature": 1.0, "max_tokens": 1200,
-            "messages": [{"role": "system", "content": ENTRY_AGENT_SYSTEM_PROMPT},
-                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]}
+    messages = [
+        {"role": "system", "content": ENTRY_AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
     endpoint = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}",
                "Content-Type": "application/json"}
-    content = None
-    for max_tokens in (1200, 2400):
-        request_body = {**body, "max_tokens": max_tokens}
+    for attempt, max_tokens in enumerate((8192, 16384), start=1):
+        request_body = {"model": OPENAI_MODEL, "temperature": 1.0, "max_tokens": max_tokens,
+                        "messages": messages}
         response = requests.post(endpoint, headers=headers, json=request_body,
                                  timeout=(15, LLM_REQUEST_TIMEOUT_SEC))
         cache_llm_response(response, "dynamic_entry_planner")
         response.raise_for_status()
-        response_data = response.json()
-        choices = response_data.get("choices") or []
-        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-        content = (choice.get("message") or {}).get("content")
-        if choice.get("finish_reason") != "length":
-            break
-    else:
-        raise ValueError("动态入口规划 Agent 连续两次因 token 上限截断")
+        try:
+            response_data = response.json()
+            choices = response_data.get("choices") if isinstance(response_data, dict) else None
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            if not isinstance(choice, dict):
+                raise ValueError("动态入口规划 API 响应缺少有效的 choices")
+            if choice.get("finish_reason") == "length":
+                raise ValueError("动态入口规划 Agent 因 token 上限截断")
+            message = choice.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            return _validate_entry_plan(content, repo_dir, repository_files)
+        except ValueError:
+            if attempt == 2:
+                raise
+            print(f"[入口规划] 首次响应不可用（HTTP {response.status_code}），提高输出配额并纠正一次")
+            # Do not feed the model's rejected content back into the next request.
+            messages = [*messages, {"role": "user", "content":
+                "上一次未返回可用规划。请只输出一个完整 JSON 对象；command 只能是 "
+                "python 或 python3 加一个有效的仓库内相对 .py 路径，不加参数。"
+                "入口、项目目录和依赖清单须彼此匹配。"}]
+
+
+def _validate_entry_plan(content: Any, repo_dir: Path,
+                         repository_files: Optional[list]) -> Dict[str, Any]:
     if not isinstance(content, str) or not content.strip():
         raise ValueError("动态入口规划 Agent 返回空内容")
     match = re.search(r"\{.*\}", content.strip(), flags=re.S)

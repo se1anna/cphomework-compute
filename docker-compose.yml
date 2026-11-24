@@ -7,13 +7,16 @@ services:
       # Dockerfile.mirror is a build-only derivative of the supplied CP.zip
       # Dockerfile; it changes only Ubuntu/PyPI mirrors for this host.
       dockerfile: Dockerfile.fast
-    container_name: rfc-audit-agent-worker
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     read_only: true
     cap_drop:
       - ALL
+    # Bound aggregate host impact when several independent fuzz workers run.
+    cpus: 2.0
+    mem_limit: 2g
+    memswap_limit: 2g
     pids_limit: 256
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=512m
@@ -33,7 +36,7 @@ services:
       - PIP_DEFAULT_TIMEOUT=30
       - PIP_RETRIES=5
       - MALICIOUS_DEPENDENCY_CACHE_FILE=/app/cache/dependency-audit/malicious-dependencies.json
-      - AUDIT_LOG_FILE=/app/logs/audit.jsonl
+      - AUDIT_LOG_FILE=/app/logs/workers/{worker_id}/audit.jsonl
       - GIT_SSH_KNOWN_HOSTS_FILE=/run/secrets/git-ssh/known_hosts
     volumes:
       # 持久化缓存卷 (确保学生虚拟环境与 wheel 跨容器复用)

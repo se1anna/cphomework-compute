@@ -188,6 +188,8 @@ docker compose up -d --build
 ```bash
 docker compose logs -f rfc-audit-agent
 
+每个 Worker 的 `logs/workers/<Worker-ID>/audit.jsonl` 同时持久保存结构化任务审计事件和逐行任务处理 `stdout`/`stderr`；空队列轮询不写入持久文件，但仍可在 Docker stdout/stderr 实时查看。JSONL 中的输出字段会遮蔽常见凭据格式（URL userinfo、Bearer/API token、私钥块）。旧的 `logs/audit.jsonl` 保留不动。该日志卷目前没有自动轮转，需纳入磁盘容量监控和归档策略。
+
 ### 私有 Git 仓库（SSH）
 
 每个任务报文携带本次仓库对应的 `task.deployKey`，计算节点只在该任务拉取阶段临时使用它：

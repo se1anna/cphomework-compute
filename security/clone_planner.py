@@ -33,13 +33,16 @@ ALWAYS_METADATA = {
 }
 
 
-def _safe_path(path: str) -> bool:
-    """Allow only tracked source/config paths, never generated/cache assets."""
-    value = path.replace("\\", "/").strip().lstrip("/")
-    parts = value.split("/")
-    if not value or ".." in parts or any(part in EXCLUDED_DIRS for part in parts):
+def is_safe_checkout_path(path: str) -> bool:
+    """Validate the original Git name without rewriting it into another path."""
+    parts = path.split("/")
+    if (
+        "\\" in path
+        or any(ord(char) < 32 or ord(char) == 127 for char in path)
+        or any(part in {"", ".", ".."} or part.lower() in EXCLUDED_DIRS for part in parts)
+    ):
         return False
-    lower = value.lower()
+    lower = path.lower()
     if any(lower.endswith(ext) for ext in FILTERED_EXTENSIONS):
         return False
     name = parts[-1]
@@ -69,7 +72,7 @@ def _week_tokens(task: TaskPayload) -> List[str]:
 
 
 def _fallback_paths(task: TaskPayload, tree: Sequence[str]) -> List[str]:
-    safe = [p for p in tree if _safe_path(p)]
+    safe = [p for p in tree if is_safe_checkout_path(p)]
     tokens = _week_tokens(task)
     matched = [p for p in safe if any(token.lower() in p.lower().split("/") for token in tokens)]
     requested_subpath = (task.subpath or "").strip().strip("/")
@@ -129,7 +132,7 @@ def _nearest_dependency_manifests(paths: Iterable[str], safe_tree: Sequence[str]
 
 def choose_sparse_paths(task: TaskPayload, tree: Sequence[str], gitignore: str = "") -> tuple[List[str], str]:
     """Ask the metadata-only Agent for paths, then validate and expand them locally."""
-    safe_tree = sorted({p.replace("\\", "/") for p in tree if _safe_path(p)})
+    safe_tree = sorted({p for p in tree if is_safe_checkout_path(p)})
     fallback = _fallback_paths(task, safe_tree)
     if not OPENAI_API_BASE or not OPENAI_API_KEY or not safe_tree:
         return fallback, "metadata planner unavailable; used safe local week/source fallback"

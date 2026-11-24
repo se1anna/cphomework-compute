@@ -3,6 +3,7 @@ RFC Audit Agent - 全局配置中心
 """
 
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -16,11 +17,6 @@ CARGO_CACHE_DIR = CACHE_DIR / "cargo-cache"
 MALICIOUS_DEPENDENCY_CACHE_FILE = Path(
     os.getenv("MALICIOUS_DEPENDENCY_CACHE_FILE", str(CACHE_DIR / "malicious-dependencies.json"))
 )
-AUDIT_LOG_FILE = Path(os.getenv("AUDIT_LOG_FILE", str(BASE_DIR / "logs" / "audit.jsonl")))
-
-# 确保目录存在
-for d in [WORKSPACE_DIR, CACHE_DIR, VENV_CACHE_DIR, PIP_CACHE_DIR, CARGO_CACHE_DIR, AUDIT_LOG_FILE.parent]:
-    d.mkdir(parents=True, exist_ok=True)
 
 # 控制层连接参数
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://localhost:8787")
@@ -33,6 +29,27 @@ if not COMPUTE_AUTH_TOKEN:
     COMPUTE_AUTH_TOKEN = uuid.uuid4().hex
 
 WORKER_ID = os.getenv("WORKER_ID", "rfc-audit-worker-01")
+# Distinguish replicas sharing the same configured worker family. Docker sets a
+# unique HOSTNAME for each container; this preserves the base ID for local runs.
+_container_suffix = os.getenv("HOSTNAME", "").strip()[-8:]
+if _container_suffix and _container_suffix not in {"localhost", "local"}:
+    WORKER_ID = f"{WORKER_ID}-{_container_suffix}"
+
+# Give each replica its own audit file. Compose may provide {worker_id} as a
+# path template; sanitize the identifier before using it as a path component.
+_worker_log_component = re.sub(r"[^A-Za-z0-9_.-]+", "_", WORKER_ID).strip("._-") or "worker"
+_audit_log_path = os.getenv(
+    "AUDIT_LOG_FILE",
+    str(BASE_DIR / "logs" / "workers" / f"{_worker_log_component}.jsonl"),
+)
+if "{worker_id}" in _audit_log_path:
+    _audit_log_path = _audit_log_path.replace("{worker_id}", _worker_log_component)
+AUDIT_LOG_FILE = Path(_audit_log_path)
+os.environ["AUDIT_LOG_FILE"] = str(AUDIT_LOG_FILE)
+
+# 确保目录存在
+for d in [WORKSPACE_DIR, CACHE_DIR, VENV_CACHE_DIR, PIP_CACHE_DIR, CARGO_CACHE_DIR, AUDIT_LOG_FILE.parent]:
+    d.mkdir(parents=True, exist_ok=True)
 
 # 衔尾蛇 (Ouroboros) 轮询时钟 (秒)
 POLL_INTERVAL_EMPTY = int(os.getenv("POLL_INTERVAL_EMPTY", "15"))   # 空队列休眠 15 秒

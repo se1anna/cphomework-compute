@@ -50,6 +50,30 @@ class TestPreflightFilter(unittest.TestCase):
         result = inspect_repository_tree(self.temp_dir)
         self.assertFalse(result.passed)
 
+    def test_preflight_rejects_python_cache_directories(self):
+        (self.temp_dir / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
+        cache = self.temp_dir / "nested" / "__pycache__"
+        cache.mkdir(parents=True)
+
+        result = inspect_repository_tree(self.temp_dir)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("nested/__pycache__" in item for item in result.security_risks))
+
+    def test_preflight_checks_for_bytecode_in_context_excluded_directories(self):
+        (self.temp_dir / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
+        cache = self.temp_dir / ".pytest_cache"
+        cache.mkdir()
+        (cache / "notes.md").write_text("Cached metadata\n", encoding="utf-8")
+        clean_result = inspect_repository_tree(self.temp_dir)
+        self.assertTrue(clean_result.passed)
+        self.assertEqual(clean_result.code_files, ["solution.py"])
+
+        (cache / "inert.pyc").write_bytes(b"not Python bytecode")
+        result = inspect_repository_tree(self.temp_dir)
+        self.assertFalse(result.passed)
+        self.assertTrue(any(".pytest_cache/inert.pyc" in item for item in result.security_risks))
+
     def test_preflight_loads_all_source_files_and_fails_closed_on_budget(self):
         for index in range(20):
             (self.temp_dir / f"module_{index}.py").write_text(f"VALUE = {index}\n", encoding="utf-8")

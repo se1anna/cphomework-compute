@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 from config import WORKSPACE_DIR
 from core.models import TaskPayload
-from security.clone_planner import ALWAYS_METADATA, choose_sparse_paths
+from security.clone_planner import ALWAYS_METADATA, choose_sparse_paths, is_safe_checkout_path
 
 
 SSH_KNOWN_HOSTS_FILE = os.getenv("GIT_SSH_KNOWN_HOSTS_FILE", "/run/secrets/git-ssh/known_hosts")
@@ -64,7 +64,7 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
     # 构建受限安全 git clone 参数:
     # 1. 深度截断 (--depth 1)
     # 2. 禁止跟随 HTTP 重定向 (防内网 SSRF 探测)
-    # 3. 限制大型对象下载 (--filter=blob:limit=15m 防超大二进制 DoS)
+    # 3. 延迟获取文件内容 (--filter=blob:none)，只检出白名单文件
     cmd = [
         "git",
         "-c", "http.followRedirects=false",
@@ -118,17 +118,25 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
         # planner choose the relevant source/config paths before any blobs are
         # materialized in the worktree.
         tree_res = subprocess.run(
-            ["git", "-C", str(task_workspace), "ls-tree", "-r", "--name-only", "-z", "HEAD"],
+            ["git", "-C", str(task_workspace), "ls-tree", "-r", "-z", "HEAD"],
             capture_output=True, timeout=45, env=git_env,
         )
         if tree_res.returncode != 0:
             err = (tree_res.stderr or tree_res.stdout).decode("utf-8", errors="replace")
             return False, task_workspace, f"Git 元数据目录树读取失败: {err}"
         try:
-            # `ls-tree --name-only` C-quotes non-ASCII paths by default.
-            # `-z` emits raw NUL-delimited path bytes, preserving UTF-8 names
-            # such as Chinese filenames for the planner and sparse-checkout.
-            tree = [path.decode("utf-8") for path in tree_res.stdout.split(b"\0") if path]
+            # Read raw names and allow only regular files, never symlinks or
+            # submodule entries. Git separates metadata from the name by a tab.
+            tree = {}
+            for record in tree_res.stdout.split(b"\0"):
+                if not record:
+                    continue
+                metadata, raw_path = record.split(b"\t", 1)
+                if metadata.split(b" ", 1)[0] not in {b"100644", b"100755"}:
+                    continue
+                path = raw_path.decode("utf-8")
+                if is_safe_checkout_path(path):
+                    tree[path] = record
         except UnicodeDecodeError as exc:
             return (
                 False,
@@ -142,7 +150,9 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
         )
         if ignore_res.returncode == 0:
             gitignore = ignore_res.stdout
-        selected, planner_log = choose_sparse_paths(task, tree, gitignore)
+        selected, planner_log = choose_sparse_paths(task, sorted(tree), gitignore)
+        if any(path not in tree for path in selected):
+            return False, task_workspace, "检出规划包含未获准的 Git 路径，未写入工作区"
 
         # An explicitly supplied subpath is authoritative, but still only
         # safe tracked source/config files under that path are materialized.
@@ -157,30 +167,54 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
             if not selected:
                 return False, task_workspace, f"指定子路径未找到可检出的安全代码文件: `{requested_subpath}`"
 
-        sparse_res = subprocess.run(
-            ["git", "-C", str(task_workspace), "sparse-checkout", "set", "--no-cone", "--stdin"],
-            input="".join(f"/{path}\n" for path in selected),
-            capture_output=True, text=True, timeout=45, env=git_env,
-        )
-        if sparse_res.returncode != 0:
-            return False, task_workspace, f"Git sparse-checkout 失败: {sparse_res.stderr or sparse_res.stdout}"
+        if not selected:
+            return False, task_workspace, "Git 仓库没有可检出的安全代码文件"
 
-        # `clone --no-checkout` leaves the worktree empty.  On the Git version
-        # used by the worker, `sparse-checkout set` updates the sparse patterns
-        # and index but does not materialize blobs by itself.  Explicitly
-        # apply the index or preflight will incorrectly report an empty repo.
+        # Older Git lazily fetches missing blobs one at a time in checkout-index.
+        # Prefetch only missing allowlisted blobs in one promisor request.
+        local_objects = subprocess.run(
+            ["git", "-C", str(task_workspace), "cat-file", "--batch-all-objects",
+             "--batch-check=%(objectname)", "--unordered"],
+            capture_output=True, timeout=45, env=git_env,
+        )
+        if local_objects.returncode != 0:
+            return False, task_workspace, "Git 本地对象索引读取失败"
+        selected_blobs = {tree[path].split(b"\t", 1)[0].split()[-1] for path in selected}
+        missing_blobs = selected_blobs.difference(local_objects.stdout.splitlines())
+        if missing_blobs:
+            prefetch = subprocess.run(
+                ["git", "-C", str(task_workspace), "-c", "http.followRedirects=false",
+                 "-c", "transfer.fsckObjects=true", "-c", "fetch.negotiationAlgorithm=noop",
+                 "fetch", "origin", "--no-tags", "--no-write-fetch-head",
+                 "--recurse-submodules=no", "--filter=blob:none", "--stdin"],
+                input=b"\n".join(sorted(missing_blobs)) + b"\n",
+                capture_output=True, timeout=45, env=git_env,
+            )
+            if prefetch.returncode != 0:
+                err = (prefetch.stderr or prefetch.stdout).decode("utf-8", errors="replace")
+                return False, task_workspace, f"Git 白名单文件下载失败: {err}"
+
+        # Populate the initially empty index with exactly the approved tree
+        # entries. NUL-delimited index records are never pathspecs or patterns.
+        index_res = subprocess.run(
+            ["git", "-C", str(task_workspace), "update-index", "-z", "--index-info"],
+            input=b"".join(tree[path] + b"\0" for path in selected),
+            capture_output=True, timeout=45, env=git_env,
+        )
+        if index_res.returncode != 0:
+            err = (index_res.stderr or index_res.stdout).decode("utf-8", errors="replace")
+            return False, task_workspace, f"Git 索引初始化失败: {err}"
+
+        # --all is limited to the approved entries in that index.
         materialize_res = subprocess.run(
-            ["git", "-C", str(task_workspace), "read-tree", "-mu", "HEAD"],
-            capture_output=True, text=True, timeout=45, env=git_env,
+            ["git", "-C", str(task_workspace), "checkout-index", "--all"],
+            capture_output=True, timeout=45, env=git_env,
         )
         if materialize_res.returncode != 0:
-            return False, task_workspace, (
-                "Git sparse-checkout 文件落地失败: "
-                f"{materialize_res.stderr or materialize_res.stdout}"
-            )
-        materialized = [path for path in selected if (task_workspace / path).is_file()]
-        if not materialized:
-            return False, task_workspace, "Git sparse-checkout 返回成功但未落地任何选定文件"
+            err = (materialize_res.stderr or materialize_res.stdout).decode("utf-8", errors="replace")
+            return False, task_workspace, f"Git 白名单文件检出失败: {err}"
+        if not all((task_workspace / path).is_file() for path in selected):
+            return False, task_workspace, "Git 未完整检出白名单文件"
         clone_logs.append(f"仓库元数据已读取，仅检出 {len(selected)} 个任务相关文件 ({planner_log})")
 
         # 子路径支持 (Monorepo)

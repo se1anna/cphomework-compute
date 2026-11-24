@@ -6,6 +6,9 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, model_validator
 
 
+MAX_EVALUATION_ROUNDS = 3
+
+
 class EvaluationRound(BaseModel):
     """历史评测单轮记录"""
     round: int

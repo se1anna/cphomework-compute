@@ -55,7 +55,7 @@ class TestDynamicEntryPlanner(unittest.TestCase):
             )
 
         self.assertEqual(post.call_count, 2)
-        self.assertEqual([call.kwargs["json"]["max_tokens"] for call in post.call_args_list], [1200, 2400])
+        self.assertEqual([call.kwargs["json"]["max_tokens"] for call in post.call_args_list], [8192, 16384])
         self.assertEqual(cache.call_count, 2)
         self.assertEqual(result["path"], "main.py")
         self.assertEqual(result["run"], "true")
@@ -66,25 +66,37 @@ class TestDynamicEntryPlanner(unittest.TestCase):
              patch.object(nodes, "OPENAI_API_BASE", "http://model.invalid/v1"), \
              patch.object(nodes, "cache_llm_response"), \
              patch.object(nodes.requests, "post", side_effect=responses) as post:
-            with self.assertRaisesRegex(ValueError, "连续两次.*截断"):
+            with self.assertRaisesRegex(ValueError, "token 上限截断"):
                 nodes._agent_entry_plan(
                     self.task, self.repo, {"main.py": "print('synthetic')"}, "python",
                     ["main.py"],
                 )
         self.assertEqual(post.call_count, 2)
 
-    def test_empty_content_fails_without_replaying_completed_response(self):
-        response = self.response("", "stop")
+    def test_retries_empty_or_invalid_plan_and_validates_replacement(self):
+        good_plan = json.dumps({"run": True, "path": "main.py", "command": "python main.py"})
+        for content in ("", '{"run":', '{"path":"main.py","command":"python main.py --plot"}'):
+            with self.subTest(content=content), \
+                 patch.object(nodes, "OPENAI_API_KEY", "test-key"), \
+                 patch.object(nodes, "OPENAI_API_BASE", "http://model.invalid/v1"), \
+                 patch.object(nodes, "cache_llm_response"), \
+                 patch.object(nodes.requests, "post", side_effect=[
+                     self.response(content, "stop"), self.response(good_plan, "stop"),
+                 ]) as post:
+                result = nodes._agent_entry_plan(self.task, self.repo, {"main.py": ""}, "python")
+                self.assertEqual(result["path"], "main.py")
+                self.assertEqual(post.call_count, 2)
+                self.assertIn("不加参数", post.call_args.kwargs["json"]["messages"][-1]["content"])
+
+    def test_invalid_command_is_still_rejected_after_retry(self):
+        response = self.response('{"path":"main.py","command":"python main.py --plot"}', "stop")
         with patch.object(nodes, "OPENAI_API_KEY", "test-key"), \
              patch.object(nodes, "OPENAI_API_BASE", "http://model.invalid/v1"), \
              patch.object(nodes, "cache_llm_response"), \
              patch.object(nodes.requests, "post", return_value=response) as post:
-            with self.assertRaisesRegex(ValueError, "返回空内容"):
-                nodes._agent_entry_plan(
-                    self.task, self.repo, {"main.py": "print('synthetic')"}, "python",
-                    ["main.py"],
-                )
-        self.assertEqual(post.call_count, 1)
+            with self.assertRaisesRegex(ValueError, "直接 Python 文件执行校验"):
+                nodes._agent_entry_plan(self.task, self.repo, {"main.py": ""}, "python")
+        self.assertEqual(post.call_count, 2)
 
 
 if __name__ == "__main__":
