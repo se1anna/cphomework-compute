@@ -11,7 +11,8 @@ from .models import TaskPayload, RFCReportPayload
 def build_security_rejection_report(
     task: TaskPayload,
     reason: str,
-    violations: list[str] = None
+    violations: list[str] = None,
+    previous_run_executed: bool = False,
 ) -> RFCReportPayload:
     """仅为有具体证据的安全违规生成拒止报告 (0分)。"""
     violations = violations or [reason]
@@ -19,6 +20,10 @@ def build_security_rejection_report(
         return " ".join(str(value).replace("\x00", "").split())[:limit]
 
     v_lines = "\n".join([f"- {clean(v)}" for v in violations[:12]])
+    execution_status = (
+        "依赖检查发生在前序运行之后，发现以下具体风险；命中风险的操作没有启动，后续评测已停止："
+        if previous_run_executed else "静态安全检查发现以下具体风险证据，因此本次没有执行提交代码："
+    )
     
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     memo = f"""### 作业评测报告：安全检查未通过
@@ -31,7 +36,7 @@ def build_security_rejection_report(
 ---
 
 #### 1. 安全检查结果
-静态安全检查发现以下具体风险证据，因此本次没有执行提交代码：
+{execution_status}
 
 {v_lines}
 

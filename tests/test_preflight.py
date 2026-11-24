@@ -50,6 +50,23 @@ class TestPreflightFilter(unittest.TestCase):
         result = inspect_repository_tree(self.temp_dir)
         self.assertFalse(result.passed)
 
+    def test_preflight_blocks_symlinks_into_similarly_named_sibling(self):
+        repo = self.temp_dir / "repo"
+        sibling = self.temp_dir / "repo-other"
+        repo.mkdir()
+        sibling.mkdir()
+        source = sibling / "reference.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        (repo / "reference.py").symlink_to(source)
+        (repo / "other").symlink_to(sibling, target_is_directory=True)
+
+        result = inspect_repository_tree(repo)
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.code_files, [])
+        self.assertTrue(any("reference.py" in item for item in result.security_risks))
+        self.assertTrue(any("other" in item for item in result.security_risks))
+
     def test_preflight_rejects_python_cache_directories(self):
         (self.temp_dir / "solution.py").write_text("VALUE = 1\n", encoding="utf-8")
         cache = self.temp_dir / "nested" / "__pycache__"
@@ -65,9 +82,10 @@ class TestPreflightFilter(unittest.TestCase):
         cache = self.temp_dir / ".pytest_cache"
         cache.mkdir()
         (cache / "notes.md").write_text("Cached metadata\n", encoding="utf-8")
+        (cache / "helper.py").write_text("VALUE = 2\n", encoding="utf-8")
         clean_result = inspect_repository_tree(self.temp_dir)
         self.assertTrue(clean_result.passed)
-        self.assertEqual(clean_result.code_files, ["solution.py"])
+        self.assertCountEqual(clean_result.code_files, ["solution.py", ".pytest_cache/helper.py"])
 
         (cache / "inert.pyc").write_bytes(b"not Python bytecode")
         result = inspect_repository_tree(self.temp_dir)

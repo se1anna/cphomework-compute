@@ -11,10 +11,24 @@ from pathlib import Path
 from typing import Optional, Tuple
 from config import WORKSPACE_DIR
 from core.models import TaskPayload
-from security.clone_planner import ALWAYS_METADATA, choose_sparse_paths, is_safe_checkout_path
+from security.clone_planner import (
+    ALWAYS_METADATA,
+    choose_sparse_paths,
+    is_safe_checkout_path,
+    is_safe_repository_path,
+)
 
 
 SSH_KNOWN_HOSTS_FILE = os.getenv("GIT_SSH_KNOWN_HOSTS_FILE", "/run/secrets/git-ssh/known_hosts")
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg", ".avif", ".ico")
+MAX_TRACKED_IMAGE_PATHS = 24
+MAX_TRACKED_IMAGE_PATH_LENGTH = 256
+
+
+def task_workspace_path(task_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", task_id):
+        raise ValueError("任务标识不能用作工作区目录名")
+    return WORKSPACE_DIR / f"run_{task_id}"
 
 
 def _ssh_repo_url(repo_url: str) -> str:
@@ -49,12 +63,15 @@ def _stage_ssh_key(deploy_key: Optional[str]) -> str:
     return staged
 
 
-def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
+def prepare_student_workspace(
+    task: TaskPayload, *, tracked_image_paths: Optional[list[str]] = None
+) -> Tuple[bool, Path, str]:
     """
     为任务创建独立的工作区目录，并安全浅克隆学生代码仓库
     返回: (success: bool, target_workdir: Path, log: str)
+    成功时可额外填充相对于 target_workdir 的图片路径样本，不检出这些图片。
     """
-    task_workspace = WORKSPACE_DIR / f"run_{task.taskId}"
+    task_workspace = task_workspace_path(task.taskId)
     if task_workspace.exists():
         shutil.rmtree(task_workspace, ignore_errors=True)
     task_workspace.mkdir(parents=True, exist_ok=True)
@@ -124,6 +141,9 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
         if tree_res.returncode != 0:
             err = (tree_res.stderr or tree_res.stdout).decode("utf-8", errors="replace")
             return False, task_workspace, f"Git 元数据目录树读取失败: {err}"
+        requested_subpath = (task.subpath or "").strip().lstrip("/\\")
+        image_prefix = requested_subpath.rstrip("/\\") + "/" if requested_subpath not in {"", "."} else ""
+        image_paths: list[str] = []
         try:
             # Read raw names and allow only regular files, never symlinks or
             # submodule entries. Git separates metadata from the name by a tab.
@@ -137,6 +157,18 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
                 path = raw_path.decode("utf-8")
                 if is_safe_checkout_path(path):
                     tree[path] = record
+                elif (
+                    tracked_image_paths is not None
+                    and len(image_paths) < MAX_TRACKED_IMAGE_PATHS
+                    and path.startswith(image_prefix)
+                    and len(path) <= MAX_TRACKED_IMAGE_PATH_LENGTH
+                    and path.lower().endswith(IMAGE_SUFFIXES)
+                    and path.isprintable()
+                    and is_safe_repository_path(path)
+                ):
+                    # The extension and tree entry are evidence of a tracked
+                    # path only. No image blob, SVG text, or pixels are read.
+                    image_paths.append(path.removeprefix(image_prefix))
         except UnicodeDecodeError as exc:
             return (
                 False,
@@ -156,7 +188,6 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
 
         # An explicitly supplied subpath is authoritative, but still only
         # safe tracked source/config files under that path are materialized.
-        requested_subpath = (task.subpath or "").strip().lstrip("/\\")
         if requested_subpath and requested_subpath not in {"."}:
             selected = [
                 path for path in selected
@@ -235,6 +266,13 @@ def prepare_student_workspace(task: TaskPayload) -> Tuple[bool, Path, str]:
             else:
                 return False, task_workspace, f"学生指定的子路径不存在: `{clean_sub}`"
 
+        if tracked_image_paths is not None:
+            tracked_image_paths[:] = image_paths
+        # The task needs materialized files, not the transient clone's object
+        # store or config. Never expose unreviewed blobs through the sandbox.
+        git_dir = task_workspace / ".git"
+        if git_dir.is_dir():
+            shutil.rmtree(git_dir)
         return True, target_dir, "\n".join(clone_logs)
 
     except subprocess.TimeoutExpired:

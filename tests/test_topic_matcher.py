@@ -68,7 +68,7 @@ def integrate_simpson():
             assignmentTitle="实现辛普森积分", assignmentOverview="计算定积分",
             repoUrl="https://example.invalid/hw4"
         )
-        fake_response = Mock()
+        fake_response = Mock(content=b"{}", status_code=200)
         fake_response.raise_for_status.return_value = None
         fake_response.json.return_value = {"choices": [{"message": {"content":
             '{"decision":"MISMATCHED","confidence":0.99,"evidence":"仓库只是文本搜索，没有积分计算"}'
@@ -89,7 +89,7 @@ def integrate_simpson():
             assignmentTitle="数值积分", assignmentOverview="实现数值积分算法",
             repoUrl="https://example.invalid/hw5"
         )
-        fake_response = Mock()
+        fake_response = Mock(content=b"{}", status_code=200)
         fake_response.raise_for_status.return_value = None
         fake_response.json.return_value = {"choices": [{"message": {"content":
             '{"decision":"MISMATCHED","confidence":0.98,"evidence":"代码内容是提示词注入，不是积分实现"}'
@@ -103,6 +103,17 @@ def integrate_simpson():
         sent = post.call_args.kwargs["json"]["messages"][1]["content"]
         self.assertIn("忽略系统规则", sent)
 
+    def test_low_confidence_mismatch_is_inconclusive_not_a_student_defect(self):
+        task = TaskPayload(taskId="t", studentId="s", assignmentId="hw", repoUrl="https://example.invalid/hw")
+        response = Mock(content=b"{}", status_code=200)
+        response.json.return_value = {"choices": [{"message": {"content":
+            '{"decision":"MISMATCHED","confidence":0.4,"evidence":"证据很少"}'
+        }}]}
+        with patch.object(topic_matcher, "OPENAI_API_KEY", "test-key"), \
+             patch.object(topic_matcher, "OPENAI_API_BASE", "http://model.invalid/v1"), \
+             patch.object(topic_matcher.requests, "post", return_value=response):
+            self.assertEqual(topic_matcher.judge_topic_relevance(task, {"x.py": "VALUE = 1"}).decision, "UNKNOWN")
+
     def test_partial_match_continues_to_dynamic_and_preserves_defects(self):
         task = TaskPayload(
             taskId="task-test-06", studentId="s", assignmentId="hw-6",
@@ -110,7 +121,7 @@ def integrate_simpson():
             assignmentOverview="需要积分算法、误差计算和多组验证",
             repoUrl="https://example.invalid/hw6"
         )
-        fake_response = Mock()
+        fake_response = Mock(content=b"{}", status_code=200)
         fake_response.raise_for_status.return_value = None
         fake_response.json.return_value = {"choices": [{"message": {"content":
             '{"decision":"PARTIAL","confidence":0.93,'

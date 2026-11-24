@@ -8,6 +8,7 @@ import unittest
 import tempfile
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -18,7 +19,7 @@ sys.path.insert(0, str(ROOT_DIR))
 from core.models import TaskPayload
 from sandbox.runner import execute_code_sandbox
 from security.cloner import prepare_student_workspace
-from security.clone_planner import is_safe_checkout_path
+from security.clone_planner import choose_sparse_paths, is_safe_checkout_path
 
 
 class TestSandboxSecurityHardening(unittest.TestCase):
@@ -176,6 +177,16 @@ print(f"WORKER_ID={worker_id}")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f"# inert fixture: {name}\n", encoding="utf-8")
 
+        # The image suffix is not evidence of valid pixels. Only regular
+        # tracked entries under the submitted directory are reported.
+        image = repo / "项目" / "plots" / "收敛.PNG"
+        ignored_image = repo / "项目" / ".cache" / "cached.png"
+        sibling_image = repo / "项目-其他" / "result.jpg"
+        for number, asset in enumerate((image, ignored_image, sibling_image)):
+            asset.parent.mkdir(parents=True, exist_ok=True)
+            asset.write_bytes(f"inert fixture {number}".encode("ascii"))
+        (image.parent / "alias.PNG").symlink_to(image.name)
+
         git = ["git", "-C", str(repo)]
         subprocess.run(git + ["init", "-q"], check=True)
         subprocess.run(git + ["config", "uploadpack.allowFilter", "true"], check=True)
@@ -192,14 +203,28 @@ print(f"WORKER_ID={worker_id}")
             repoUrl=repo.as_uri(), subpath="项目",
         )
         selected = [tracked[0], tracked[2], tracked[3]]
+        tracked_images = []
         with patch("security.cloner.choose_sparse_paths", return_value=(selected, "test planner")):
-            success, target, log = prepare_student_workspace(task)
+            success, target, log = prepare_student_workspace(task, tracked_image_paths=tracked_images)
 
         self.assertTrue(success, log)
         self.assertEqual(target.name, "项目")
+        self.assertEqual(tracked_images, ["plots/收敛.PNG"])
+        self.assertFalse((target.parent / ".git").exists())
         files = {p.relative_to(target.parent).as_posix() for p in target.parent.rglob("*")
                  if p.is_file() and ".git" not in p.relative_to(target.parent).parts}
         self.assertEqual(files, set(selected))
+
+    def test_explicit_submission_directory_overrides_assignment_name_guess(self):
+        task = TaskPayload(
+            taskId="task-explicit-dir", studentId="s", assignmentId="hw-9",
+            assignmentTitle="第 9 周", repoUrl="https://example.invalid/repo", subpath="physics/lattice",
+        )
+        tree = ["week9/other.py", "physics/lattice/nested/main.py", "physics/lattice/requirements.txt"]
+        with patch("security.clone_planner.requests.post") as post:
+            paths, _ = choose_sparse_paths(task, tree)
+        post.assert_not_called()
+        self.assertEqual(paths, tree[1:])
 
     @patch("security.cloner.SSH_KNOWN_HOSTS_FILE", __file__)
     @patch("security.cloner.subprocess.run")
@@ -244,6 +269,128 @@ print(f"WORKER_ID={worker_id}")
         self.assertEqual(result.tests_passed, 0)
         self.assertEqual(result.tests_total, 0)
         self.assertIn("PASS OK passed", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "Linux/POSIX sandbox output capture")
+    def test_sandbox_drains_both_streams_and_caps_output(self):
+        (self.temp_dir / "solution.py").write_text(
+            "import sys\n"
+            "for _ in range(32):\n"
+            "    print('o' * 8192, flush=True)\n"
+            "    print('e' * 8192, file=sys.stderr, flush=True)\n",
+            encoding="utf-8",
+        )
+        result = execute_code_sandbox(
+            self.temp_dir, language="python", entry_file="solution.py", timeout_sec=5,
+        )
+        self.assertTrue(result.executed)
+        self.assertEqual(result.exit_code, 0)
+        self.assertLessEqual(len(result.stdout), 16384)
+        self.assertLessEqual(len(result.stderr), 16384)
+        self.assertIn("o" * 64, result.stdout)
+        self.assertIn("e" * 64, result.stderr)
+        self.assertIn("输出已截断", result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "Linux/POSIX sandbox timeout")
+    def test_sandbox_timeout_keeps_captured_output(self):
+        (self.temp_dir / "solution.py").write_text(
+            "import time\nprint('started', flush=True)\ntime.sleep(15)\n",
+            encoding="utf-8",
+        )
+        start = time.monotonic()
+        result = execute_code_sandbox(
+            self.temp_dir, language="python", entry_file="solution.py", timeout_sec=1,
+        )
+        self.assertTrue(result.executed)
+        self.assertEqual(result.exit_code, -9)
+        self.assertIn("started", result.stdout)
+        self.assertIn("Hard Timeout", result.stderr)
+        self.assertLess(time.monotonic() - start, 8)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process dumpability guard")
+    def test_worker_can_disable_dumpability_without_changing_the_test_process(self):
+        completed = subprocess.run(
+            [
+                sys.executable, "-c",
+                "import ctypes; from sandbox.runner import harden_worker_process; "
+                "harden_worker_process(); "
+                "print(ctypes.CDLL(None).prctl(3, 0, 0, 0, 0))",
+            ],
+            cwd=ROOT_DIR, capture_output=True, text=True, check=True, timeout=20,
+        )
+        self.assertEqual(completed.stdout.strip(), "0")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux kernel sandbox")
+    def test_sandbox_contains_filesystem_and_network_without_breaking_threads(self):
+        repo = self.temp_dir / "project"
+        repo.mkdir()
+        (repo / "input.txt").write_text("42", encoding="utf-8")
+        sentinel = self.temp_dir / "isolated-test-fixture"
+        sentinel.write_text("synthetic fixture", encoding="utf-8")
+        (repo / "solution.py").write_text(
+            "from pathlib import Path\n"
+            "import socket, tempfile, threading\n"
+            "assert Path('input.txt').read_text() == '42'\n"
+            "thread = threading.Thread(target=lambda: Path('result.txt').write_text('ok'))\n"
+            "thread.start()\n"
+            "thread.join()\n"
+            "with tempfile.TemporaryFile() as output:\n"
+            "    output.write(b'fixture')\n"
+            f"outside = Path({str(sentinel)!r})\n"
+            "for harmless_probe in (outside.read_text, lambda: outside.write_text('changed'),\n"
+            "                       lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM)):\n"
+            "    try:\n"
+            "        harmless_probe()\n"
+            "    except PermissionError:\n"
+            "        continue\n"
+            "    raise AssertionError('sandbox did not block synthetic probe')\n",
+            encoding="utf-8",
+        )
+        result = execute_code_sandbox(repo, entry_file="solution.py", timeout_sec=5)
+        self.assertTrue(result.executed, result.stderr)
+        self.assertEqual(result.exit_code, 0, result.stderr)
+        self.assertEqual((repo / "result.txt").read_text(encoding="utf-8"), "ok")
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "synthetic fixture")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux kernel sandbox")
+    def test_sandbox_fails_closed_when_launcher_cannot_start(self):
+        (self.temp_dir / "solution.py").write_text(
+            "from pathlib import Path\nPath('ran').touch()\n", encoding="utf-8",
+        )
+        with patch("sandbox.runner._LINUX_LAUNCHER", self.temp_dir / "missing_launcher.py"):
+            result = execute_code_sandbox(self.temp_dir, entry_file="solution.py", timeout_sec=5)
+        self.assertFalse(result.executed)
+        self.assertEqual(result.error_summary, "SANDBOX_UNAVAILABLE")
+        self.assertFalse((self.temp_dir / "ran").exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux kernel sandbox")
+    def test_sandbox_imports_selected_venv_but_cannot_modify_it(self):
+        venv = self.temp_dir / "venv"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)],
+                       check=True, capture_output=True, timeout=20)
+        python = venv / "bin" / "python"
+        libraries = next(venv.glob("lib/python*/site-packages"))
+        module = libraries / "test_scientific_dependency.py"
+        module.write_text("value = 42\n", encoding="utf-8")
+        repo = self.temp_dir / "project"
+        repo.mkdir()
+        (repo / "solution.py").write_text(
+            "from pathlib import Path\n"
+            "from test_scientific_dependency import value\n"
+            "assert value == 42\n"
+            "try:\n"
+            f"    Path({str(module)!r}).write_text('value = 1')\n"
+            "except PermissionError:\n"
+            "    print('venv-read-only')\n"
+            "else:\n"
+            "    raise AssertionError('venv is writable')\n",
+            encoding="utf-8",
+        )
+        with patch("sandbox.runner.get_or_create_cached_venv", return_value=(str(python), "")):
+            result = execute_code_sandbox(repo, entry_file="solution.py", timeout_sec=5)
+        self.assertTrue(result.executed, result.stderr)
+        self.assertEqual(result.exit_code, 0, result.stderr)
+        self.assertIn("venv-read-only", result.stdout)
+        self.assertEqual(module.read_text(encoding="utf-8"), "value = 42\n")
 
     @patch("security.cloner.SSH_KNOWN_HOSTS_FILE", __file__)
     @patch("security.cloner.subprocess.run")

@@ -14,7 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from core.models import TaskPayload, StaticAnalysisResult, DynamicRunResult
-from graph.nodes import check_score_reasonability, score_arbiter_node
+from graph.nodes import check_score_reasonability, extract_score_from_llm_output, score_arbiter_node
 from graph.workflow import build_audit_graph
 
 
@@ -69,8 +69,8 @@ class TestCheckScoreReasonabilityRules(unittest.TestCase):
         self.assertTrue(is_ok)
         self.assertIsNone(reason)
 
-    def test_sandbox_crash_high_score_rejected(self):
-        """规则 1：沙箱报错崩溃但给分超过 85 分，必须被驳回并建议下调至 80 分以下过程分"""
+    def test_nonzero_exit_alone_does_not_cap_score(self):
+        """单凭非零退出码或进程文字不能覆盖评分。"""
         static_pass = StaticAnalysisResult(passed=True, security_clean=True, topic_matched=True, violations=[])
         dynamic_crash = DynamicRunResult(
             executed=True,
@@ -86,9 +86,9 @@ class TestCheckScoreReasonabilityRules(unittest.TestCase):
             score=95.0,
             memo="代码结构优美"
         )
-        self.assertFalse(is_ok)
-        self.assertIn("沙箱动态执行异常", reason)
-        self.assertEqual(rec_score, 78.0)
+        self.assertTrue(is_ok)
+        self.assertIsNone(reason)
+        self.assertIsNone(rec_score)
 
     def test_sandbox_crash_moderate_score_accepted(self):
         """规则 1：沙箱报错但给 75 分过程分，合理放行"""
@@ -283,6 +283,29 @@ class TestScoreArbiterNode(unittest.TestCase):
         self.assertNotIn("final_score", res)
         self.assertNotIn("final_report_payload", res)
         self.assertNotIn("rfc_report", res)
+
+    def test_final_score_rejects_conflicting_unquoted_markers(self):
+        first = "**最终评定分数**: **20.0 / 100.0**"
+        second = "**最终评定分数**: **78.0 / 100.0**"
+        self.assertIsNone(extract_score_from_llm_output(f"{first}\n{second}"))
+        self.assertEqual(extract_score_from_llm_output(f"````text\n```\n{first}\n````\n{second}"), 78.0)
+
+    def test_hard_cap_replaces_the_authoritative_displayed_score(self):
+        state = {
+            "task": self.task,
+            "static_analysis": StaticAnalysisResult(passed=True, security_clean=True, topic_matched=True),
+            "dynamic_run": DynamicRunResult(
+                executed=True, exit_code=1, error_summary="STUDENT_MISSING_REQUIREMENTS_TXT: confirmed",
+            ),
+            "final_score": 95.0,
+            "rfc_report": "提交报告正文。\n\n**最终评定分数**: **95.0 / 100.0**",
+            "arbitration_retries": 2,
+        }
+        result = score_arbiter_node(state)
+        report = result["final_report_payload"]
+        self.assertEqual(report.score, 78.0)
+        self.assertEqual(extract_score_from_llm_output(report.details), report.score)
+        self.assertEqual(report.details.count("最终评定分数"), 1)
 
 
 class TestScoreArbiterGraphLoopE2E(unittest.TestCase):

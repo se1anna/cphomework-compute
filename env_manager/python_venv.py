@@ -6,6 +6,7 @@ RFC Audit Agent - Python 虚拟环境哈希持久化复用管理器
 import sys
 import os
 import hashlib
+import fcntl
 import subprocess
 import tempfile
 import shutil
@@ -87,6 +88,9 @@ def get_or_create_cached_venv(
     # 若未提供依赖清单，使用系统默认 Python
     if not req_file:
         return sys.executable, f"[Venv Info] 从 Agent 选定目录 `{search_dir.relative_to(repo_root) or '.'}` 向上未找到依赖清单，使用默认 Python。"
+    req_file = req_file.resolve(strict=True)
+    if repo_root not in req_file.parents:
+        raise ValueError("依赖清单越出作业仓库")
     if req_file.stat().st_size == 0:
         return sys.executable, f"[Venv Info] Agent 选定的依赖清单 `{req_file.relative_to(repo_root)}` 为空，使用默认 Python。"
 
@@ -99,14 +103,29 @@ def get_or_create_cached_venv(
     # Validate declarations before any install-side effect. A fresh cache
     # namespace prevents reuse of environments made by the previous pipeline.
     declarations = parse_dependency_manifest(req_file)
-    req_hash = compute_requirements_hash(f"safe-wheel-v1\n{req_relative}\n{content}")
-    target_venv_dir = VENV_CACHE_DIR / f"venv_safe_wheels_v1_{req_hash}"
+    req_hash = compute_requirements_hash(f"safe-wheel-v2\n{req_relative}\n{content}")
+    target_venv_dir = VENV_CACHE_DIR / f"venv_safe_wheels_v2_{req_hash}"
+    VENV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Docker replicas use a shared cache. An interpreter appearing on disk
+    # does not mean dependency installation and audit have completed.
+    with target_venv_dir.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _prepare_cached_environment(
+            target_venv_dir, req_hash, req_relative, declarations,
+            search_dir.relative_to(repo_root).as_posix() or ".",
+        )
+
+
+def _prepare_cached_environment(
+    target_venv_dir: Path, req_hash: str, req_relative: str,
+    declarations: list[str], project_relative: str,
+) -> Tuple[str, str]:
     python_exe = get_venv_python_executable(target_venv_dir)
+    ready = target_venv_dir / ".audited"
 
     # 1. 命中缓存：直接 0ms 复用已持久化的虚拟环境
-    if target_venv_dir.exists() and python_exe.exists():
+    if ready.is_file() and python_exe.exists():
         audit_venv_dependencies(target_venv_dir)
-        project_relative = search_dir.relative_to(repo_root).as_posix() or "."
         log = (f"[Venv Cache Hit] Agent 选择 `{project_relative}`；"
                f"使用依赖清单 `{req_relative}`，命中缓存 ({req_hash})。")
         return str(python_exe), log
@@ -115,6 +134,8 @@ def get_or_create_cached_venv(
     # This avoids executing student-provided PEP 517/build-system hooks.
     setup_logs = [f"[Venv Cache Miss] 首次遇到依赖哈希 ({req_hash})，正在创建独立持久化环境..."]
     try:
+        if target_venv_dir.exists():
+            shutil.rmtree(target_venv_dir)
         install_home = target_venv_dir / "install-home"
         install_tmp = target_venv_dir / "install-tmp"
         install_home.mkdir(parents=True, exist_ok=True)
@@ -168,10 +189,13 @@ def get_or_create_cached_venv(
                         f"仅 wheel 依赖下载失败 (退出码 {downloaded.returncode}); 未运行构建后端"
                     )
                 audit_wheelhouse(wheelhouse)
+                # Download already resolved the full dependency set. Install
+                # exactly the audited files without following dependency URLs
+                # or doing a second round of resolution during installation.
                 install_cmd = [
                     str(python_exe), "-m", "pip", "install", "--no-index",
                     "--disable-pip-version-check", "--no-input", "--only-binary=:all:",
-                    "--find-links", str(wheelhouse), "-r", str(safe_requirements),
+                    "--no-deps", *(str(wheel) for wheel in sorted(wheelhouse.glob("*.whl"))),
                 ]
                 installed = subprocess.run(
                     install_cmd, capture_output=True, text=True, timeout=180, env=install_env,
@@ -180,7 +204,7 @@ def get_or_create_cached_venv(
                     raise RuntimeError(f"已审计 wheel 安装失败 (退出码 {installed.returncode})")
 
         audit_venv_dependencies(target_venv_dir)
-        project_relative = search_dir.relative_to(repo_root).as_posix() or "."
+        ready.touch(exist_ok=False)
         setup_logs.append(
             f"[Venv Success] Agent 选择 `{project_relative}`；"
             f"`{req_relative}` 已通过预检、wheel-only 安装和安装后审计；缓存键 `{req_hash}`。"

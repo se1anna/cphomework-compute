@@ -9,7 +9,8 @@ import zipfile
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 from env_manager.python_venv import compute_requirements_hash, get_or_create_cached_venv
-from security.dependency_audit import audit_wheelhouse, parse_dependency_manifest
+from env_manager.dependency_evidence import corroborates_missing_import
+from security.dependency_audit import _installed_distributions, audit_wheelhouse, parse_dependency_manifest
 from core.exceptions import DependencyRiskException
 
 
@@ -32,6 +33,19 @@ class TestPythonVenv(unittest.TestCase):
         py_exe, log = get_or_create_cached_venv(self.temp_dir)
         self.assertTrue(Path(py_exe).exists())
         self.assertIn("默认 Python", log)
+
+    def test_installed_distribution_inventory_needs_no_venv_interpreter(self):
+        site_packages = self.temp_dir / "lib" / "python3.10" / "site-packages"
+        metadata_dir = site_packages / "demo_package-1.2.dist-info"
+        metadata_dir.mkdir(parents=True)
+        (metadata_dir / "METADATA").write_text("Name: demo-package\nVersion: 1.2\n", encoding="utf-8")
+        self.assertEqual(_installed_distributions(site_packages), [{"name": "demo-package", "version": "1.2"}])
+
+    def test_missing_import_claim_requires_an_independent_source_import(self):
+        stderr = "ModuleNotFoundError: No module named 'numpy'\n"
+        self.assertTrue(corroborates_missing_import(stderr, {"main.py": "from numpy.linalg import norm"}))
+        self.assertFalse(corroborates_missing_import(stderr, {"main.py": "from .numpy import local"}))
+        self.assertFalse(corroborates_missing_import(stderr, {"main.py": "# import numpy", "README.md": "import numpy"}))
 
     def test_requirements_rejects_pip_directives_and_urls_before_install(self):
         for content in ("-e git+https://example.invalid/repo\n", "demo @ https://example.invalid/demo.whl\n", "./local-package\n"):
@@ -80,13 +94,19 @@ class TestPythonVenv(unittest.TestCase):
              patch("env_manager.python_venv.PIP_CACHE_DIR", pip_cache), \
              patch("env_manager.python_venv.subprocess.run", side_effect=fake_run) as run, \
              patch("env_manager.python_venv.audit_venv_dependencies", return_value=[]):
-            get_or_create_cached_venv(repo, requirements_file="requirements.txt")
+            python, _ = get_or_create_cached_venv(repo, requirements_file="requirements.txt")
+            cached_python, cache_log = get_or_create_cached_venv(repo, requirements_file="requirements.txt")
 
         self.assertEqual(run.call_count, 3)
+        self.assertEqual(python, cached_python)
+        self.assertIn("Venv Cache Hit", cache_log)
         calls = [call.args[0] for call in run.call_args_list]
         self.assertIn("download", calls[1])
         self.assertIn("--only-binary=:all:", calls[1])
         self.assertIn("--no-index", calls[2])
+        self.assertIn("--no-deps", calls[2])
+        self.assertNotIn("-r", calls[2])
+        self.assertEqual(Path(calls[2][-1]).name, "demo_package-1.0-py3-none-any.whl")
         for call in run.call_args_list:
             env = call.kwargs["env"]
             self.assertNotIn("OPENAI_API_KEY", env)

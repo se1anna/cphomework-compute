@@ -20,6 +20,8 @@ services:
     pids_limit: 256
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=512m
+      # Each replica gets its own bounded workspace; Python reads files as data.
+      - /app/workspace:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=512m
     environment:
       - ENVIRONMENT=production
       - CONTROL_PLANE_URL=${CONTROL_PLANE_URL:-http://host.docker.internal:8787}
@@ -44,7 +46,6 @@ services:
       - ./cache/pip-cache:/app/cache/pip-cache
       - ./cache/cargo-cache:/app/cache/cargo-cache
       - ./cache/dependency-audit:/app/cache/dependency-audit
-      - ./workspace:/app/workspace
       - ./logs:/app/logs
       - ./secrets/ssh/known_hosts:/run/secrets/git-ssh/known_hosts:ro
     # 若宿主机支持 NVIDIA GPU，取消下方注释启用 CUDA 直通

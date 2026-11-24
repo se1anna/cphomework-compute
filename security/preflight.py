@@ -72,28 +72,43 @@ def inspect_repository_tree(repo_dir: Path) -> PreflightResult:
         dirs[:] = [name for name in dirs if name not in {".git", "__pycache__"}]
         exclude_context = not CONTEXT_EXCLUDED_DIRS.isdisjoint(rel_root.parts)
 
+        for dirname in list(dirs):
+            directory = root_path / dirname
+            if directory.is_symlink():
+                reason = f"仓库含不会被静态扫描遍历的目录符号链接: {directory.relative_to(resolved_base)}"
+                risk_reasons.append(reason)
+                security_risks.append(reason)
+                dirs.remove(dirname)
+
         for fname in files:
             fpath = root_path / fname
             suffix = fpath.suffix.lower()
-            if exclude_context and suffix not in PYTHON_BYTECODE_EXTENSIONS:
-                continue
-            total_files += 1
-            
             # 1. 符号链接安全检查 (防止指向宿主机 /etc 或父目录)
             if fpath.is_symlink():
                 try:
-                    target = fpath.resolve()
-                    if not str(target).startswith(str(resolved_base)):
-                        rel_link = str(fpath.relative_to(resolved_base)).replace("\\", "/")
-                        reason = f"检测到指向仓库外部的符号链接: {rel_link} -> {target}"
+                    target = fpath.resolve(strict=True)
+                    if resolved_base not in target.parents:
+                        reason = f"检测到指向仓库外部的符号链接: {fpath.relative_to(resolved_base)}"
                         risk_reasons.append(reason)
                         security_risks.append(reason)
                         continue
-                except Exception:
+                except (OSError, RuntimeError):
                     reason = f"检测到无法解析的符号链接: {fname}"
                     risk_reasons.append(reason)
                     security_risks.append(reason)
                     continue
+
+            if not fpath.is_file():
+                reason = f"检测到非普通文件，无法安全审计: {fpath.relative_to(resolved_base)}"
+                risk_reasons.append(reason)
+                security_risks.append(reason)
+                continue
+
+            if exclude_context and suffix not in (
+                EXECUTABLE_SOURCE_EXTENSIONS | OPAQUE_EXECUTABLE_EXTENSIONS
+            ) and fname not in {"Makefile", "CMakeLists.txt", "Cargo.toml", "Dockerfile"}:
+                continue
+            total_files += 1
 
             # 2. 检查文件名中是否有路径遍历/特殊字符
             if ".." in fname or "\0" in fname:

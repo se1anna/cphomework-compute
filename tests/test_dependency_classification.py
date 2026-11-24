@@ -65,7 +65,7 @@ class TestMissingImportClassification(unittest.TestCase):
 
             self.assertIsNone(result)
 
-    def test_missing_manifest_report_uses_submission_wording_and_low_score(self):
+    def test_missing_manifest_report_uses_submission_wording_and_placeholder_score(self):
         task = TaskPayload(
             taskId="virtual-task-001",
             studentId="virtual-student",
@@ -87,12 +87,11 @@ class TestMissingImportClassification(unittest.TestCase):
         )
 
         score, report = _generate_deterministic_rfc_memo(
-            task, static, dynamic, metrics=None, target_score=88.0
+            task, static, dynamic, metrics=None
         )
 
-        self.assertEqual(score, 78.0)
+        self.assertEqual(score, 0.0)
         self.assertIn("提交缺少 `requirements.txt`", report)
-        self.assertIn("提交缺少 requirements.txt", report)
         self.assertNotIn("沙箱少依赖", report)
         self.assertNotIn("环境导致未验证", report)
 

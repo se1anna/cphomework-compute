@@ -16,8 +16,7 @@ from config import (
     COMPUTE_AUTH_TOKEN,
     WORKER_ID,
     POLL_INTERVAL_EMPTY,
-    COOLDOWN_AFTER_TASK,
-    WORKSPACE_DIR
+    COOLDOWN_AFTER_TASK
 )
 from core.models import MAX_EVALUATION_ROUNDS, TaskPayload, RFCReportPayload
 from core.fallback import (
@@ -28,10 +27,11 @@ from core.fallback import (
 from core.exceptions import SecurityRiskException
 from core.exceptions import LLMUnavailableException
 from core.fallback import build_llm_unavailable_report
-from security.cloner import prepare_student_workspace
+from security.cloner import prepare_student_workspace, task_workspace_path
 from graph.direct_pipeline import run_direct_audit
 from client.control_plane import ControlPlaneClient
 from core.audit_log import install_stream_capture, write_event
+from sandbox.runner import harden_worker_process
 
 
 # Capture all subsequent process output in the worker-specific persistent JSONL.
@@ -142,8 +142,11 @@ def run_ouroboros_daemon():
             else:
                 # Step A: 安全浅克隆与工作区准备
                 print("- 正在检出学生代码仓库...")
-                clone_success, target_workdir, clone_log = prepare_student_workspace(task)
-                task_workspace = WORKSPACE_DIR / f"run_{task.taskId}"
+                tracked_image_paths: list[str] = []
+                task_workspace = task_workspace_path(task.taskId)
+                clone_success, target_workdir, clone_log = prepare_student_workspace(
+                    task, tracked_image_paths=tracked_image_paths
+                )
 
                 if not clone_success:
                     print(f"[Preflight Block] 检出失败，直接出具拒止报告: {clone_log}")
@@ -158,6 +161,7 @@ def run_ouroboros_daemon():
                     initial_state = {
                         "task": task,
                         "repo_dir": str(target_workdir),
+                        "tracked_image_paths": tracked_image_paths,
                         "nonce": "",
                         "retry_count": 0,
                         "retry_context": ""
@@ -215,4 +219,5 @@ def run_ouroboros_daemon():
 
 
 if __name__ == "__main__":
+    harden_worker_process()
     run_ouroboros_daemon()

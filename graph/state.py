@@ -23,6 +23,7 @@ class AuditState(TypedDict, total=False):
     preflight: Optional[PreflightResult]
     raw_code_files: Dict[str, str]
     isolated_code_payload: str
+    tracked_image_paths: list[str]
 
     # 阶段 1：静态审计与题目契约
     static_analysis: Optional[StaticAnalysisResult]

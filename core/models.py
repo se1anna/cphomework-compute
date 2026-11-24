@@ -115,6 +115,24 @@ class StaticAnalysisResult(BaseModel):
     block_category: str = ""
 
 
+class DynamicStepEvidence(BaseModel):
+    """一次动态操作的提议、执行事实和有界输出摘录。"""
+
+    step: int
+    command: str
+    entry_file: str
+    reason: str = ""
+    goal: str = ""
+    expected_observation: str = ""
+    executed: bool
+    exit_code: int
+    tests_total: int = 0
+    tests_passed: int = 0
+    stdout_excerpt: str = ""
+    stderr_excerpt: str = ""
+    error_summary: Optional[str] = None
+
+
 class DynamicRunResult(BaseModel):
     """阶段 2：动态沙箱运行与用例断言结果"""
     executed: bool = False
@@ -128,6 +146,10 @@ class DynamicRunResult(BaseModel):
     agent_reason: str = ""
     entry_file: str = ""
     agent_trace: List[str] = Field(default_factory=list)
+    steps: List[DynamicStepEvidence] = Field(default_factory=list)
+    termination: str = ""
+    termination_step: int = 0
+    termination_reason: str = ""
     metrics: RuntimeMetrics = Field(default_factory=RuntimeMetrics)
 
 

@@ -7,16 +7,105 @@ import os
 import sys
 import re
 import ast
+import ctypes
+import selectors
+import signal
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from config import SANDBOX_TIMEOUT_SEC
+from config import PRODUCTION_MODE, SANDBOX_TIMEOUT_SEC
 from core.models import DynamicRunResult, RuntimeMetrics
 from core.exceptions import DependencyRiskException
 from core.sidecar_monitor import SidecarProcessMonitor
 from env_manager.python_venv import get_or_create_cached_venv
 from env_manager.polyglot_toolchain import build_c_cpp_project, build_rust_project
+
+
+_OUTPUT_LIMIT = 16384
+_REAP_TIMEOUT = 2
+_LINUX_LAUNCHER = Path(__file__).with_name("linux_launcher.py")
+
+
+def harden_worker_process() -> None:
+    """Protect the credential-bearing Linux daemon from same-UID ptrace/procfs reads."""
+    if sys.platform != "linux":
+        return
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong)
+    prctl.restype = ctypes.c_int
+    pr_set_dumpable = 4
+    if prctl(pr_set_dumpable, 0, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, "Worker could not disable process dumpability")
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=_REAP_TIMEOUT)
+
+
+def _reap_guarded_process(proc: subprocess.Popen, deadline: float) -> bool:
+    """Keep the leader's PID reserved until its entire process group is stopped."""
+    while os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, 0.02))
+    _stop_process(proc)
+    return True
+
+
+def _capture_posix_output(
+    proc: subprocess.Popen, timeout_sec: int, *, guarded: bool,
+) -> tuple[str, str, bool]:
+    """Drain both pipes without buffering unbounded student output."""
+    deadline = time.monotonic() + timeout_sec
+    captured = [bytearray(), bytearray()]
+    truncated = [False, False]
+    timed_out = False
+    with selectors.DefaultSelector() as selector:
+        selector.register(proc.stdout, selectors.EVENT_READ, 0)
+        selector.register(proc.stderr, selectors.EVENT_READ, 1)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 8192)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                stream = key.data
+                retention = _OUTPUT_LIMIT - len(captured[stream])
+                captured[stream].extend(chunk[:retention])
+                truncated[stream] |= len(chunk) > retention
+
+    if not timed_out and guarded:
+        timed_out = not _reap_guarded_process(proc, deadline)
+    elif not timed_out:
+        try:
+            proc.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+
+    logs = []
+    for buffer, clipped in zip(captured, truncated):
+        output = buffer.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        if clipped:
+            marker = "\n[输出已截断]"
+            output = output[:_OUTPUT_LIMIT - len(marker)] + marker
+        logs.append(output)
+    return logs[0], logs[1], timed_out
 
 
 def _classify_missing_import(
@@ -147,6 +236,13 @@ def execute_code_sandbox(
     """
     在受控沙箱环境下动态执行作业代码并全程进行旁路物理资源采样
     """
+    guarded = sys.platform == "linux" and language == "python"
+    if PRODUCTION_MODE and not guarded:
+        return DynamicRunResult(
+            executed=False, exit_code=-2,
+            stderr="当前生产沙箱仅支持 Linux 上的 Python 动态执行，未运行学生代码",
+            error_summary="SANDBOX_UNAVAILABLE",
+        )
     custom_args = custom_args or []
     setup_logs = []
     repo_dir = Path(repo_dir).resolve()
@@ -241,6 +337,8 @@ def execute_code_sandbox(
         )
 
     # 2. 启动子进程并装配旁路监控器 (Sidecar Monitor)
+    temp = None
+    status_read, status_write = None, None
     try:
         # 严格白名单纯净环境变量注入 (杜绝向学生代码泄露任何 API Key、Token、系统配置或内部服务拓扑)
         safe_env = {
@@ -261,25 +359,77 @@ def execute_code_sandbox(
             if hw_key in os.environ:
                 safe_env[hw_key] = os.environ[hw_key]
 
+        launch_cmd = cmd
+        if guarded:
+            temp = tempfile.TemporaryDirectory(prefix="cphomework-run-")
+            for key in ("TMPDIR", "TMP", "TEMP"):
+                safe_env[key] = temp.name
+            # The trusted launcher must never look up libraries in inherited paths.
+            safe_env.pop("LD_LIBRARY_PATH", None)
+            interpreter = Path(python_exe).absolute()
+            venv = interpreter.parent.parent
+            venv_path = str(venv) if (venv / "pyvenv.cfg").is_file() else ""
+            status_read, status_write = os.pipe()
+            os.set_blocking(status_read, False)
+            launch_cmd = [
+                sys.executable, "-I", "-B", "-S",
+                str(_LINUX_LAUNCHER),
+                str(status_write), str(repo_dir), temp.name, venv_path, str(interpreter), *cmd[1:],
+            ]
+
+        posix = os.name == "posix"
         proc = subprocess.Popen(
-            cmd,
+            launch_cmd,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            env=safe_env
+            text=not posix,
+            start_new_session=posix,
+            pass_fds=(status_write,) if status_write is not None else (),
+            env=safe_env,
         )
+        if status_write is not None:
+            os.close(status_write)
+            status_write = None
 
         # 启动高频旁路资源监控 (物理内存/CPU/CUDA显存)
-        monitor = SidecarProcessMonitor(proc.pid, sample_interval_sec=0.1)
-        monitor.start()
-
+        monitor = None
+        timed_out = False
         try:
-            stdout, stderr = proc.communicate(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-            metrics = monitor.stop()
+            monitor = SidecarProcessMonitor(proc.pid, sample_interval_sec=0.1)
+            monitor.start()
+            if posix:
+                stdout, stderr, timed_out = _capture_posix_output(proc, timeout_sec, guarded=guarded)
+            else:
+                try:
+                    stdout, stderr = proc.communicate(timeout=timeout_sec)
+                except subprocess.TimeoutExpired as exc:
+                    timed_out = True
+                    stdout = (exc.stdout or b"").decode("utf-8", errors="replace")
+                    stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
+        finally:
+            try:
+                if proc.returncode is None:
+                    _stop_process(proc)
+            finally:
+                proc.stdout.close()
+                proc.stderr.close()
+                if monitor is not None:
+                    metrics = monitor.stop()
+
+        if status_read is not None:
+            status = os.read(status_read, 128)
+            if status != b"ready":
+                reason = status.decode("ascii", errors="replace") or "no readiness acknowledgement"
+                print(f"[Sandbox Unavailable] sandbox launcher rejected dynamic execution ({reason})")
+                return DynamicRunResult(
+                    executed=False, exit_code=-2,
+                    stderr="评测器未能启动隔离环境，未运行学生代码",
+                    error_summary="SANDBOX_UNAVAILABLE",
+                )
+
+        if timed_out:
             return DynamicRunResult(
                 executed=True,
                 exit_code=-9,
@@ -288,8 +438,6 @@ def execute_code_sandbox(
                 error_summary=f"沙箱执行硬超时 (>{timeout_sec}s)",
                 metrics=metrics
             )
-
-        metrics = monitor.stop()
 
         full_stdout = ("\n".join(setup_logs) + "\n\n" + stdout).strip() if setup_logs else stdout
 
@@ -324,3 +472,9 @@ def execute_code_sandbox(
             stderr=f"沙箱调起失败: {str(e)}",
             error_summary=str(e)
         )
+    finally:
+        for fd in (status_read, status_write):
+            if fd is not None:
+                os.close(fd)
+        if temp:
+            temp.cleanup()

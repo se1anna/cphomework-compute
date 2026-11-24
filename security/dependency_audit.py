@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import subprocess
 import time
 import zipfile
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -158,17 +158,14 @@ def _save_cache(cache: Dict[str, Any]) -> None:
 
 
 def _installed_distributions(site_packages: Path) -> List[Dict[str, str]]:
-    result = subprocess.run(
-        [str(site_packages.parent.parent.parent / "bin" / "python"), "-m", "pip", "list", "--path", str(site_packages), "--format=json"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"无法读取已安装依赖清单: {result.stderr[:500]}")
-    data = json.loads(result.stdout or "[]")
-    return [x for x in data if isinstance(x, dict) and x.get("name")]
+    # Inspect distribution metadata as data. Starting the cached interpreter
+    # here would load its Python startup configuration before the audit.
+    distributions = []
+    for distribution in metadata.distributions(path=[str(site_packages)]):
+        name = distribution.metadata.get("Name")
+        if name:
+            distributions.append({"name": name, "version": distribution.version or "unknown"})
+    return distributions
 
 
 def _find_site_packages(venv_dir: Path) -> Path:
